@@ -8,7 +8,7 @@
 
 ## Multi-Exchange Trading Bot
 
-A modular trading bot that supports multiple exchanges including EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, and Extended. The bot implements an automated strategy that places orders and automatically closes them at a profit.
+A modular trading bot that supports EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, Extended, ApeX, Nado, Ethereal, StandX, and Bulk. The bot implements an automated strategy that places orders and automatically closes them at a profit.
 
 ## Referral Links (Enjoy fee rebates and benefits)
 
@@ -126,6 +126,12 @@ You will get 1.3x points boost; rebates (auto rebates system is expected to be l
    pip install -r apex_requirements.txt
    ```
 
+   **Bulk users**: Use Python 3.10–3.12 and install the official SDK:
+
+   ```bash
+   pip install -r bulk_requirements.txt
+   ```
+
 4. **Set up environment variables**:
    Create a `.env` file in the project root directory and use env_example.txt as a template to modify with your API keys.
 
@@ -236,6 +242,16 @@ ETH Perpetual (with Boost mode enabled):
 ```bash
 python runbot.py --exchange backpack --ticker ETH --direction buy --quantity 0.1 --boost
 ```
+
+### Bulk Exchange (single-exchange mode):
+
+Set `BULK_PRIVATE_KEY` (a Base58 private key) in `.env`, then run:
+
+```bash
+python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 --max-orders 40 --wait-time 450
+```
+
+The ticker maps to `ETH-USD`. Quantity must satisfy Bulk's lot size and minimum notional. Entry and take-profit orders use add-liquidity-only limits; take-profit orders are reduce-only. `hedge_mode.py` does not support Bulk yet.
 
 ### Aster Exchange:
 
@@ -382,7 +398,7 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 
 ### Command Line Arguments
 
-- `--exchange`: Exchange to use: 'edgex', 'backpack', 'paradex', 'aster', 'lighter', 'grvt', or 'extended' (default: edgex)
+- `--exchange`: Exchange for single-exchange mode, including `bulk` (default: `edgex`; see `python runbot.py --help` for the full list)
 - `--ticker`: Base asset symbol (e.g., ETH, BTC, SOL). Contract ID is auto-resolved.
 - `--quantity`: Order quantity (default: 0.1)
 - `--take-profit`: Take profit percent (e.g., 0.02 means 0.02%)

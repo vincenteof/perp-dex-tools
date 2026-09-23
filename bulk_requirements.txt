@@ -1,0 +1,2 @@
+# Bulk's official SDK requires Python 3.10 or newer.
+bulk-client==0.1.2

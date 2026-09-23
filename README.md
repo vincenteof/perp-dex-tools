@@ -12,7 +12,7 @@
 
 ## 自动交易机器人
 
-一个支持多个交易所（目前包括 EdgeX, Backpack, Paradex, Aster, Lighter, grvt, Extended）的模块化交易机器人。该机器人实现了自动下单并在盈利时自动平仓的策略，主要目的是取得高交易量。
+一个支持多个交易所（包括 EdgeX、Backpack、Paradex、Aster、Lighter、GRVT、Extended、ApeX、Nado、Ethereal、StandX 和 Bulk）的模块化交易机器人。该机器人实现了自动下单并在盈利时自动平仓的策略，主要目的是取得高交易量。
 
 ## 邀请链接 (获得返佣以及福利)
 
@@ -144,6 +144,12 @@ Python 版本要求（最佳选项是 Python 3.10 - 3.12）：
    pip install -r apex_requirements.txt
    ```
 
+   **Bulk 用户**：使用 Python 3.10–3.12，并额外安装官方 SDK：
+
+   ```bash
+   pip install -r bulk_requirements.txt
+   ```
+
 4. **设置环境变量**：
    在项目根目录创建`.env`文件，并使用 env_example.txt 作为样本，修改为你的 api 密匙。
 
@@ -255,6 +261,16 @@ ETH 永续合约（启用 Boost 模式）：
 ```bash
 python runbot.py --exchange backpack --ticker ETH --direction buy --quantity 0.1 --boost
 ```
+
+### Bulk 交易所（单交易所模式）：
+
+在 `.env` 中设置 `BULK_PRIVATE_KEY`（Base58 私钥），然后运行：
+
+```bash
+python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 --max-orders 40 --wait-time 450
+```
+
+交易对自动映射为 `ETH-USD`。数量必须符合 Bulk 的 lot size 和最小名义金额。开仓与止盈单使用只挂单限价单；止盈单设为 reduce-only。此适配暂不支持 `hedge_mode.py`。
 
 ### Aster 交易所：
 
@@ -413,7 +429,7 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 
 ### 命令行参数
 
-- `--exchange`: 使用的交易所：'edgex'、'backpack'、'paradex'、'aster'、'lighter'、'grvt'、'extended' 或 'nado'（默认：edgex）
+- `--exchange`: 单交易所模式的交易所名称，包括 `bulk`（默认：`edgex`；完整列表见 `python runbot.py --help`）
 - `--ticker`: 标的资产符号（例如：ETH、BTC、SOL）。合约 ID 自动解析。
 - `--quantity`: 订单数量（默认：0.1）
 - `--take-profit`: 止盈百分比（例如 0.02 表示 0.02%）

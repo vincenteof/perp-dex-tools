@@ -222,6 +222,8 @@ class TradingBot:
         except Exception as e:
             self.logger.log(f"Error placing order: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            if self.config.exchange == "bulk":
+                raise
             return False
 
     async def _handle_order_result(self, order_result) -> bool:
@@ -316,6 +318,8 @@ class TradingBot:
                 except Exception as e:
                     self.order_canceled_event.set()
                     self.logger.log(f"[CLOSE] Error canceling order {order_id}: {e}", "ERROR")
+                    if self.config.exchange == "bulk":
+                        raise
 
                 if self.config.exchange == "backpack" or self.config.exchange == "extended":
                     self.order_filled_amount = cancel_result.filled_size
@@ -355,6 +359,8 @@ class TradingBot:
                 self.last_open_order_time = time.time()
                 if not close_order_result.success:
                     self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
+                    if self.config.exchange == "bulk":
+                        raise RuntimeError(f"Bulk close order rejected: {close_order_result.error_message}")
 
             return True
 
@@ -375,7 +381,7 @@ class TradingBot:
                         self.active_close_orders.append({
                             'id': order.order_id,
                             'price': order.price,
-                            'size': order.size
+                            'size': order.remaining_size if self.config.exchange == "bulk" else order.size
                         })
 
                 # Get positions
@@ -529,7 +535,7 @@ class TradingBot:
                         self.active_close_orders.append({
                             'id': order.order_id,
                             'price': order.price,
-                            'size': order.size
+                            'size': order.remaining_size if self.config.exchange == "bulk" else order.size
                         })
 
                 # Periodic logging
