@@ -254,6 +254,8 @@ python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 
 
 The ticker maps to `ETH-USD`. Quantity must satisfy Bulk's lot size and minimum notional. Entry and take-profit orders use add-liquidity-only limits; take-profit orders are reduce-only. `hedge_mode.py` does not support Bulk yet.
 
+The Bulk WebSocket reconnects and resubscribes automatically. Trading resumes after a fresh book and account-order reconciliation. If a cancellation or an entry order's final state cannot be confirmed, the bot stops opening orders and reports the uncertainty for manual review.
+
 ### Aster Exchange:
 
 ETH:

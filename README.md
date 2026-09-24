@@ -273,6 +273,8 @@ python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 
 
 交易对自动映射为 `ETH-USD`。数量必须符合 Bulk 的 lot size 和最小名义金额。开仓与止盈单使用只挂单限价单；止盈单设为 reduce-only。此适配暂不支持 `hedge_mode.py`。
 
+Bulk WebSocket 断线后会自动重连并重新订阅；重新取得行情和账户订单后才恢复交易。若撤单结果或断线期间的开仓单终态无法确认，程序会停止继续开仓并报错，需要人工核对交易所订单与仓位。
+
 ### Aster 交易所：
 
 ETH：

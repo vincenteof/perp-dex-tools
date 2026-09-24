@@ -81,6 +81,9 @@ class TradingBot:
         self.order_canceled_event = asyncio.Event()
         self.shutdown_requested = False
         self.loop = None
+        self._bulk_open_order_id = None
+        self._bulk_waiting_for_open_ack = False
+        self._bulk_early_open_updates = {}
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -112,6 +115,16 @@ class TradingBot:
                 side = message.get('side', '')
                 order_type = message.get('order_type', '')
                 filled_size = Decimal(message.get('filled_size'))
+                if self.config.exchange == "bulk" and order_type == "OPEN":
+                    if order_id != self._bulk_open_order_id:
+                        # A fill can beat the HTTP order acknowledgement. Keep
+                        # that event by id, but never apply an old order's fill
+                        # to the order currently being monitored.
+                        if self._bulk_waiting_for_open_ack and status in {"FILLED", "CANCELED"}:
+                            self._bulk_early_open_updates[order_id] = message
+                        elif status in {"FILLED", "CANCELED"}:
+                            self.logger.log(f"[OPEN] Ignoring late Bulk update for {order_id}", "WARNING")
+                        return
                 if order_type == "OPEN":
                     self.current_order_status = status
 
@@ -158,6 +171,7 @@ class TradingBot:
                 self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
 
         # Setup order update handler
+        self._order_update_handler = order_update_handler
         self.exchange_client.setup_order_update_handler(order_update_handler)
 
     def _calculate_wait_time(self) -> Decimal:
@@ -197,6 +211,10 @@ class TradingBot:
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
             self.order_filled_amount = 0.0
+            if self.config.exchange == "bulk":
+                self._bulk_open_order_id = None
+                self._bulk_waiting_for_open_ack = True
+                self._bulk_early_open_updates.clear()
 
             # Place the order
             order_result = await self.exchange_client.place_open_order(
@@ -204,6 +222,12 @@ class TradingBot:
                 self.config.quantity,
                 self.config.direction
             )
+            if self.config.exchange == "bulk":
+                self._bulk_open_order_id = order_result.order_id
+                self._bulk_waiting_for_open_ack = False
+                early = self._bulk_early_open_updates.pop(order_result.order_id, None)
+                if early is not None:
+                    self._order_update_handler(early)
 
             if not order_result.success:
                 return False
@@ -223,9 +247,18 @@ class TradingBot:
             self.logger.log(f"Error placing order: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             # A timed-out Bulk submit may already be live. A rejected close is not.
-            if self.config.exchange == "bulk" and "outcome is unknown" in str(e):
+            if self.config.exchange == "bulk" and (
+                "outcome is unknown" in str(e)
+                or "recovery needs attention" in str(e)
+                or (self._bulk_open_order_id and isinstance(e, (ConnectionError, TimeoutError)))
+            ):
                 raise
             return False
+        finally:
+            if self.config.exchange == "bulk":
+                self._bulk_open_order_id = None
+                self._bulk_waiting_for_open_ack = False
+                self._bulk_early_open_updates.clear()
 
     async def _handle_order_result(self, order_result) -> bool:
         """Handle the result of an order placement."""
@@ -311,6 +344,8 @@ class TradingBot:
                 try:
                     cancel_result = await self.exchange_client.cancel_order(order_id)
                     if not cancel_result.success:
+                        if self.config.exchange == "bulk":
+                            raise RuntimeError(f"Bulk cancel outcome is unknown: {cancel_result.error_message}")
                         self.order_canceled_event.set()
                         self.logger.log(f"[CLOSE] Failed to cancel order {order_id}: {cancel_result.error_message}", "WARNING")
                     else:
@@ -322,7 +357,7 @@ class TradingBot:
                     if self.config.exchange == "bulk":
                         raise
 
-                if self.config.exchange == "backpack" or self.config.exchange == "extended":
+                if self.config.exchange in {"backpack", "extended", "bulk"}:
                     self.order_filled_amount = cancel_result.filled_size
                 else:
                     # Wait for cancel event or timeout

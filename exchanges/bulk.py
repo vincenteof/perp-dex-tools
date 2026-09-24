@@ -7,6 +7,7 @@ and the account stream.
 
 import asyncio
 import json
+import logging
 import os
 import time
 from decimal import Decimal
@@ -16,6 +17,8 @@ import aiohttp
 from bulk_keychain import Signer
 
 from .base import BaseExchangeClient, OrderInfo, OrderResult
+
+logger = logging.getLogger(__name__)
 
 
 class BulkClient(BaseExchangeClient):
@@ -37,15 +40,18 @@ class BulkClient(BaseExchangeClient):
         if expected_account and expected_account != self._signer.pubkey:
             raise ValueError("Bulk private key does not match BULK_ACCOUNT")
         self._connect_error: Optional[str] = None
+        self._fatal_ws_error: Optional[str] = None
         self._account_seen = False
         self._best_bid: Optional[Decimal] = None
         self._best_ask: Optional[Decimal] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_stop = asyncio.Event()
+        self._ws_ready = asyncio.Event()
         self.http: Optional[aiohttp.ClientSession] = None
         self._ws_http: Optional[aiohttp.ClientSession] = None
         self._handler = None
         self._orders: Dict[str, OrderInfo] = {}
+        self._owned_open_order_ids = set()
         self._order_events: Dict[str, asyncio.Event] = {}
         self._fill_totals: Dict[str, Decimal] = {}
         self._book_update_time = 0.0
@@ -180,18 +186,19 @@ class BulkClient(BaseExchangeClient):
                 f"Point BULK_API_URL and BULK_WS_URL at the same network. {exc}"
             ) from exc
         self._connect_error = None
+        self._fatal_ws_error = None
         self._account_seen = False
         self._ws_stop = asyncio.Event()
+        self._ws_ready.clear()
         self._ws_task = asyncio.create_task(self._run_market_socket())
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            if self._connect_error:
+            if self._fatal_ws_error:
                 raise ConnectionError(
-                    f"Bulk WebSocket on {self.ws_url} ({self.signature_domain}) rejected "
-                    f"account {self.public_key}: {self._connect_error}"
+                    f"Bulk WebSocket on {self.ws_url} ({self.signature_domain}) cannot safely "
+                    f"resume account {self.public_key}: {self._fatal_ws_error}"
                 )
-            if (self._account_seen and self._book_update_time
-                    and self._best_bid and self._best_ask):
+            if self._ws_ready.is_set():
                 return
             await asyncio.sleep(0.1)
         raise TimeoutError(
@@ -200,29 +207,82 @@ class BulkClient(BaseExchangeClient):
         )
 
     async def _run_market_socket(self) -> None:
-        if self._ws_http is None or self._ws_http.closed:
-            # No total timeout: aiohttp would cancel the socket when it expires.
-            self._ws_http = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10)
-            )
-        try:
-            async with self._ws_http.ws_connect(self.ws_url, heartbeat=20) as websocket:
-                await websocket.send_json(self.subscription_payload())
-                while not self._ws_stop.is_set():
-                    message = await websocket.receive()
-                    if message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
-                        break
-                    if message.type == aiohttp.WSMsgType.ERROR:
-                        self._connect_error = "Bulk WebSocket connection failed"
-                        break
-                    if message.type != aiohttp.WSMsgType.TEXT:
-                        continue
-                    self._handle_message(json.loads(message.data))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if self._connect_error is None:
-                self._connect_error = str(exc)
+        backoff = 1.0
+        while not self._ws_stop.is_set():
+            if self._ws_http is None or self._ws_http.closed:
+                # No total timeout: aiohttp would cancel the socket when it expires.
+                self._ws_http = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10)
+                )
+            self._ws_ready.clear()
+            self._account_seen = False
+            self._best_bid = self._best_ask = None
+            self._book_update_time = 0.0
+            self._connect_error = None
+            try:
+                async with self._ws_http.ws_connect(self.ws_url, heartbeat=20) as websocket:
+                    await websocket.send_json(self.subscription_payload())
+                    while not self._ws_stop.is_set():
+                        message = await websocket.receive()
+                        if message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
+                            logger.warning("Bulk WebSocket closed; reconnecting")
+                            break
+                        if message.type == aiohttp.WSMsgType.ERROR:
+                            raise ConnectionError("Bulk WebSocket connection failed")
+                        if message.type != aiohttp.WSMsgType.TEXT:
+                            continue
+                        self._handle_message(json.loads(message.data))
+                        if self._connect_error:
+                            raise ValueError(self._connect_error)
+                        if (not self._ws_ready.is_set() and self._account_seen
+                                and self._book_update_time):
+                            await self._reconcile_after_reconnect()
+                            self._ws_ready.set()
+                            backoff = 1.0
+            except asyncio.CancelledError:
+                raise
+            except ValueError as exc:
+                # A rejected account subscription or an unaccounted live order
+                # needs operator attention, not an endless reconnect loop.
+                self._fatal_ws_error = str(exc)
+                logger.error("Bulk WebSocket recovery stopped: %s", exc)
+                break
+            except Exception as exc:
+                logger.warning("Bulk WebSocket disconnected; reconnecting: %s", exc)
+            finally:
+                self._ws_ready.clear()
+            if not self._ws_stop.is_set():
+                await asyncio.sleep(backoff)
+                backoff = min(30.0, backoff * 2)
+
+    async def _reconcile_after_reconnect(self) -> None:
+        """Refresh tracked orders before permitting another trading action."""
+        account = await self._account()
+        live_orders = {}
+        for raw in account["openOrders"]:
+            order = self._parse_order(raw)
+            payload = raw.get("openOrder", raw)
+            if payload.get("sym", payload.get("coin", payload.get("symbol"))) == self.symbol:
+                live_orders[order.order_id] = order
+                if order.order_id in self._owned_open_order_ids:
+                    self._remember(order)
+        for order_id in list(self._owned_open_order_ids):
+            if order_id not in live_orders:
+                raise ValueError(
+                    f"Bulk opening order {order_id} disappeared during a WebSocket outage "
+                    "without a confirmed fill or cancellation"
+                )
+
+    async def _wait_market_ready(self) -> None:
+        while not self._ws_ready.is_set():
+            if self._fatal_ws_error:
+                raise RuntimeError(f"Bulk WebSocket recovery needs attention: {self._fatal_ws_error}")
+            if self._ws_stop.is_set() or self._ws_task is None or self._ws_task.done():
+                raise ConnectionError("Bulk market data is disconnected")
+            try:
+                await asyncio.wait_for(self._ws_ready.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                continue
 
     def _handle_message(self, payload: Any) -> None:
         if not isinstance(payload, dict):
@@ -276,6 +336,7 @@ class BulkClient(BaseExchangeClient):
 
     async def disconnect(self) -> None:
         self._ws_stop.set()
+        self._ws_ready.clear()
         task = self._ws_task
         self._ws_task = None
         if task is not None:
@@ -319,9 +380,17 @@ class BulkClient(BaseExchangeClient):
             filled = max(filled, prior.filled_size)
         order.filled_size = filled
         order.remaining_size = max(order.size - filled, Decimal(0))
-        if order.remaining_size == 0 and order.status != "CANCELED":
+        if prior is not None and prior.status == "FILLED":
+            order.status = "FILLED"
+        elif prior is not None and prior.status == "CANCELED" and order.status not in {"FILLED", "CANCELED"}:
+            # An account event can beat the HTTP acknowledgement. A later
+            # nonterminal acknowledgement must never revive that order.
+            order.status = "CANCELED"
+        elif order.remaining_size == 0 and order.status != "CANCELED":
             order.status = "FILLED"
         self._orders[order.order_id] = order
+        if order.status in {"FILLED", "CANCELED"}:
+            self._owned_open_order_ids.discard(order.order_id)
         self._emit(order)
         if order.status in {"FILLED", "CANCELED"}:
             self._order_events.setdefault(order.order_id, asyncio.Event()).set()
@@ -360,8 +429,7 @@ class BulkClient(BaseExchangeClient):
             })
 
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
-        if self._ws_task is None or self._ws_task.done():
-            raise ConnectionError("Bulk market data is disconnected")
+        await self._wait_market_ready()
         if time.monotonic() - self._book_update_time > 30:
             raise TimeoutError("Bulk order book has not updated for 30 seconds")
         if contract_id != self.symbol or self._best_bid is None or self._best_ask is None:
@@ -411,8 +479,7 @@ class BulkClient(BaseExchangeClient):
         return str(name), body if isinstance(body, dict) else {}
 
     async def _place_limit(self, quantity: Decimal, price: Decimal, side: str, reduce_only: bool) -> OrderResult:
-        if self._ws_task is None or self._ws_task.done():
-            return OrderResult(success=False, error_message="Bulk trading connection is unavailable")
+        await self._wait_market_ready()
         if quantity <= 0 or quantity % self._lot_size != 0 or price <= 0:
             return OrderResult(success=False, error_message="Invalid Bulk price or order quantity")
         if not reduce_only and quantity * price < self._min_notional:
@@ -440,6 +507,8 @@ class BulkClient(BaseExchangeClient):
             if normalized.startswith("cancel"):
                 return OrderResult(False, error_message=str(body.get("message") or status_name))
             status = self._status(status_name)
+            if not reduce_only and status not in {"FILLED", "CANCELED"}:
+                self._owned_open_order_ids.add(order_id)
             self._remember(OrderInfo(
                 order_id, side, quantity, price, status,
                 filled_size=self._fill_totals.get(order_id, Decimal(0)),
@@ -480,8 +549,7 @@ class BulkClient(BaseExchangeClient):
             raise RuntimeError(f"Bulk order {order_id} cannot be located for cancellation")
         if order.status in {"FILLED", "CANCELED"}:
             return OrderResult(True, order_id, filled_size=order.filled_size)
-        if self._ws_task is None or self._ws_task.done():
-            raise ConnectionError("Bulk trading connection is unavailable")
+        await self._wait_market_ready()
         try:
             signed = self._signer.sign({
                 "type": "cancel",
@@ -492,6 +560,9 @@ class BulkClient(BaseExchangeClient):
             normalized = status_name.lower().replace("_", "").replace("-", "")
             if normalized == "error" or normalized.startswith("rejected"):
                 raise RuntimeError(str(body.get("message") or status_name))
+            acknowledged = str(body.get("oid") or "")
+            if acknowledged and acknowledged != order_id:
+                raise RuntimeError("Bulk cancel acknowledgement has a different order id")
             event = self._order_events.setdefault(order_id, asyncio.Event())
             try:
                 await asyncio.wait_for(event.wait(), timeout=5)
@@ -499,12 +570,65 @@ class BulkClient(BaseExchangeClient):
                 pass
             latest = self._orders.get(order_id, order)
             if latest.status not in {"FILLED", "CANCELED"}:
-                latest.status = "CANCELED"
+                # The socket may have missed the terminal update. A cancel
+                # request acknowledgement alone does not report partial fills.
+                account = await self._account()
+                latest = self._orders.get(order_id, order)
+                if latest.status in {"FILLED", "CANCELED"}:
+                    return OrderResult(True, order_id, filled_size=latest.filled_size)
+                if any(
+                    str(raw.get("openOrder", raw).get("oid")
+                        or raw.get("openOrder", raw).get("orderId") or "") == order_id
+                    for raw in account["openOrders"]
+                ):
+                    raise RuntimeError(f"Bulk order {order_id} is still active after cancellation")
+                if self._status(status_name) != "CANCELED":
+                    raise RuntimeError(
+                        f"Bulk order {order_id} is absent, but cancel acknowledgement "
+                        f"did not confirm a terminal state: {status_name}"
+                    )
+                filled = await self._filled_size_from_history(order_id)
+                latest = self._orders.get(order_id, order)
+                if latest.status in {"FILLED", "CANCELED"}:
+                    return OrderResult(True, order_id, filled_size=latest.filled_size)
+                if filled > latest.size:
+                    raise RuntimeError(f"Bulk fills exceed original size for order {order_id}")
+                latest.filled_size = max(latest.filled_size, filled)
+                latest.status = "FILLED" if latest.filled_size == latest.size else "CANCELED"
                 self._remember(latest)
             stored = self._orders[order_id]
             return OrderResult(True, order_id, filled_size=stored.filled_size)
         except Exception as exc:
             raise RuntimeError(f"Bulk cancel outcome is unknown: {exc}") from exc
+
+    async def _filled_size_from_history(self, order_id: str) -> Decimal:
+        """Read authoritative fills only when a cancel event was missed."""
+        response = await self._request("POST", "account", json={
+            "type": "fills", "user": self.public_key,
+        })
+        if isinstance(response, list):
+            rows = response
+        elif isinstance(response, dict) and isinstance(response.get("data"), list):
+            rows = response["data"]
+            if response.get("page", {}).get("hasMore"):
+                raise RuntimeError("Bulk fill history is paginated; cancel fill size is unconfirmed")
+        else:
+            raise ValueError("Bulk returned an invalid fills response")
+        total = Decimal(0)
+        for wrapper in rows:
+            if not isinstance(wrapper, dict):
+                raise ValueError("Bulk returned an invalid fill")
+            fill = wrapper.get("fills", wrapper)
+            if not isinstance(fill, dict) or fill.get("symbol") != self.symbol:
+                continue
+            maker = fill.get("maker") == self.public_key
+            taker = fill.get("taker") == self.public_key
+            if not (maker or taker):
+                raise ValueError("Bulk fill does not belong to the signer account")
+            filled_order_id = fill.get("orderIdMaker") if maker else fill.get("orderIdTaker")
+            if str(filled_order_id or "") == order_id:
+                total += Decimal(str(fill["amount"]))
+        return total
 
     @staticmethod
     def _parse_order(raw: Dict[str, Any]) -> OrderInfo:

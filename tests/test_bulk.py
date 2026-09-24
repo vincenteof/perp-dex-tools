@@ -3,8 +3,10 @@ import os
 import time
 import unittest
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import aiohttp
 import base58
 
 from exchanges.base import OrderResult
@@ -13,6 +15,11 @@ from exchanges.bulk import BulkClient
 
 def _resting(order_id: str) -> dict:
     return {"response": {"data": {"statuses": [{"resting": {"oid": order_id}}]}}}
+
+
+async def _timeout_wait(awaitable, timeout):
+    awaitable.close()
+    raise asyncio.TimeoutError
 
 
 class BulkClientTests(unittest.IsolatedAsyncioTestCase):
@@ -29,6 +36,7 @@ class BulkClientTests(unittest.IsolatedAsyncioTestCase):
 
     def _market_is_connected(self):
         self.client._ws_task = asyncio.get_running_loop().create_future()
+        self.client._ws_ready.set()
         self.client._best_bid = Decimal("1999")
         self.client._best_ask = Decimal("2000")
         self.client._book_update_time = time.monotonic()
@@ -88,6 +96,7 @@ class BulkClientTests(unittest.IsolatedAsyncioTestCase):
                 }},
             })
             self.client._handle_message({"type": "account", "data": {"type": "snapshot"}})
+            self.client._ws_ready.set()
             await asyncio.Event().wait()
 
         with patch.object(self.client, "_run_market_socket", socket):
@@ -156,6 +165,32 @@ class BulkClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         self.assertEqual(prices, [Decimal("2671.701"), Decimal("2671.626")])
 
+    async def test_terminal_event_before_open_ack_cannot_be_revived(self):
+        self._market_is_connected()
+        self.client._lot_size = Decimal("0.0001")
+        self.client._min_notional = Decimal("50")
+        self.config.tick_size = Decimal("0.001")
+        self.client._signer = type("StubSigner", (), {
+            "sign": staticmethod(lambda payload: {
+                "actions": [{"l": {}}], "nonce": 1, "account": "a",
+                "signer": "a", "signature": "s", "order_id": "entry",
+            }),
+        })()
+
+        async def post(_signed):
+            self.client._handle_account_data({
+                "type": "orderUpdate", "sym": "ETH-USD", "oid": "entry",
+                "isBuy": True, "sz": "0", "origSz": "0.1", "fillSz": "0.1",
+                "px": "1999.999", "status": "filled",
+            })
+            return _resting("entry")
+
+        self.client._post_signed = post
+        result = await self.client.place_open_order("ETH-USD", Decimal("0.1"), "buy")
+        self.assertEqual(result.status, "FILLED")
+        self.assertEqual(result.filled_size, Decimal("0.1"))
+        self.assertNotIn("entry", self.client._owned_open_order_ids)
+
     async def test_cancel_returns_confirmed_partial_fill(self):
         self._market_is_connected()
         self.client._orders["entry"] = self.client._parse_order({
@@ -185,6 +220,7 @@ class BulkClientTests(unittest.IsolatedAsyncioTestCase):
             return {"response": {"data": {"statuses": [{"cancelled": {"oid": "entry"}}]}}}
 
         self.client._signer = type("StubSigner", (), {
+            "pubkey": self.client.public_key,
             "sign": staticmethod(lambda payload: {
                 "actions": [{"cx": {}}], "nonce": 1, "account": "a",
                 "signer": "a", "signature": "s",
@@ -196,6 +232,195 @@ class BulkClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.filled_size, Decimal("0.4"))
         self.assertEqual(events[-1]["status"], "CANCELED")
         self.assertEqual(events[-1]["filled_size"], "0.4")
+
+    async def test_cancel_without_event_checks_account_and_fills(self):
+        self._market_is_connected()
+        self.client._orders["entry"] = self.client._parse_order({
+            "sym": "ETH-USD", "oid": "entry", "sz": "1", "origSz": "1",
+            "px": "2000", "status": "placed", "isBuy": True,
+        })
+        self.client.get_order_info = AsyncMock(return_value=self.client._orders["entry"])
+        self.client._account = AsyncMock(return_value={"openOrders": [], "positions": []})
+        self.client._request = AsyncMock(return_value={"data": [{
+            "symbol": "ETH-USD", "maker": self.client.public_key,
+            "taker": "other", "orderIdMaker": "entry", "amount": "0.4",
+        }], "page": {"hasMore": False}})
+        self.client._signer = type("StubSigner", (), {
+            "pubkey": self.client.public_key,
+            "sign": staticmethod(lambda payload: {
+                "actions": [{"cx": {}}], "nonce": 1, "account": "a",
+                "signer": "a", "signature": "s",
+            }),
+        })()
+        self.client._post_signed = AsyncMock(return_value={
+            "response": {"data": {"statuses": [{"cancelled": {"oid": "entry"}}]}}
+        })
+        with patch("exchanges.bulk.asyncio.wait_for", new=_timeout_wait):
+            result = await self.client.cancel_order("entry")
+        self.assertEqual(result.filled_size, Decimal("0.4"))
+        self.assertEqual(self.client._orders["entry"].status, "CANCELED")
+
+    async def test_cancel_does_not_invent_terminal_state_while_order_is_live(self):
+        self._market_is_connected()
+        self.client._orders["entry"] = self.client._parse_order({
+            "sym": "ETH-USD", "oid": "entry", "sz": "1", "origSz": "1",
+            "px": "2000", "status": "placed", "isBuy": True,
+        })
+        self.client.get_order_info = AsyncMock(return_value=self.client._orders["entry"])
+        self.client._account = AsyncMock(return_value={"openOrders": [{
+            "sym": "ETH-USD", "oid": "entry", "sz": "1", "origSz": "1",
+            "px": "2000", "status": "placed", "isBuy": True,
+        }], "positions": []})
+        self.client._signer = type("StubSigner", (), {
+            "sign": staticmethod(lambda payload: {
+                "actions": [{"cx": {}}], "nonce": 1, "account": "a",
+                "signer": "a", "signature": "s",
+            }),
+        })()
+        self.client._post_signed = AsyncMock(return_value={
+            "response": {"data": {"statuses": [{"placed": {"oid": "entry"}}]}}
+        })
+        with patch("exchanges.bulk.asyncio.wait_for", new=_timeout_wait):
+            with self.assertRaisesRegex(RuntimeError, "still active"):
+                await self.client.cancel_order("entry")
+        self.assertEqual(self.client._orders["entry"].status, "OPEN")
+
+    async def test_cancel_needs_terminal_ack_even_if_order_is_absent(self):
+        self._market_is_connected()
+        self.client._orders["entry"] = self.client._parse_order({
+            "sym": "ETH-USD", "oid": "entry", "sz": "1", "origSz": "1",
+            "px": "2000", "status": "placed", "isBuy": True,
+        })
+        self.client.get_order_info = AsyncMock(return_value=self.client._orders["entry"])
+        self.client._account = AsyncMock(return_value={"openOrders": [], "positions": []})
+        self.client._signer = type("StubSigner", (), {
+            "sign": staticmethod(lambda payload: {
+                "actions": [{"cx": {}}], "nonce": 1, "account": "a",
+                "signer": "a", "signature": "s",
+            }),
+        })()
+        self.client._post_signed = AsyncMock(return_value={
+            "response": {"data": {"statuses": [{"placed": {"oid": "entry"}}]}}
+        })
+        with patch("exchanges.bulk.asyncio.wait_for", new=_timeout_wait):
+            with self.assertRaisesRegex(RuntimeError, "did not confirm a terminal state"):
+                await self.client.cancel_order("entry")
+        self.assertEqual(self.client._orders["entry"].status, "OPEN")
+
+    async def test_cancel_keeps_terminal_event_arriving_during_account_check(self):
+        self._market_is_connected()
+        self.client._orders["entry"] = self.client._parse_order({
+            "sym": "ETH-USD", "oid": "entry", "sz": "1", "origSz": "1",
+            "px": "2000", "status": "placed", "isBuy": True,
+        })
+        self.client.get_order_info = AsyncMock(return_value=self.client._orders["entry"])
+
+        async def account():
+            self.client._remember(self.client._parse_order({
+                "sym": "ETH-USD", "oid": "entry", "sz": "0", "origSz": "1",
+                "fillSz": "1", "px": "2000", "status": "filled", "isBuy": True,
+            }))
+            return {"openOrders": [], "positions": []}
+
+        self.client._account = account
+        self.client._signer = type("StubSigner", (), {
+            "sign": staticmethod(lambda payload: {
+                "actions": [{"cx": {}}], "nonce": 1, "account": "a",
+                "signer": "a", "signature": "s",
+            }),
+        })()
+        self.client._post_signed = AsyncMock(return_value={
+            "response": {"data": {"statuses": [{"cancelled": {"oid": "entry"}}]}}
+        })
+        self.client._request = AsyncMock()
+        with patch("exchanges.bulk.asyncio.wait_for", new=_timeout_wait):
+            result = await self.client.cancel_order("entry")
+        self.assertEqual(result.filled_size, Decimal("1"))
+        self.assertEqual(self.client._orders["entry"].status, "FILLED")
+        self.client._request.assert_not_awaited()
+
+    async def test_reconnect_requires_reconciliation_of_live_open_order(self):
+        self.client._orders["entry"] = self.client._parse_order({
+            "sym": "ETH-USD", "oid": "entry", "sz": "1", "origSz": "1",
+            "px": "2000", "status": "placed", "isBuy": True,
+        })
+        self.client._owned_open_order_ids.add("entry")
+        self.client._account = AsyncMock(return_value={"openOrders": [], "positions": []})
+        with self.assertRaisesRegex(ValueError, "disappeared"):
+            await self.client._reconcile_after_reconnect()
+        self.client._account.return_value["openOrders"] = [{
+            "sym": "ETH-USD", "oid": "entry", "sz": "0.6", "origSz": "1",
+            "fillSz": "0.4", "px": "2000", "status": "partiallyFilled", "isBuy": True,
+        }]
+        await self.client._reconcile_after_reconnect()
+        self.assertEqual(self.client._orders["entry"].filled_size, Decimal("0.4"))
+
+    async def test_market_socket_reconnects_and_refreshes_the_book(self):
+        self.client._account = AsyncMock(return_value={"openOrders": [], "positions": []})
+        account = SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data='{"type":"account","data":{"type":"snapshot"}}')
+        book = SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=(
+            '{"type":"l2Snapshot","data":{"book":{"symbol":"ETH-USD",'
+            '"levels":[[{"px":"1999"}],[{"px":"2000"}]]}}}'
+        ))
+        closed = SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None)
+
+        class FakeSocket:
+            def __init__(self, messages):
+                self.messages = iter(messages)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def send_json(self, _payload):
+                pass
+
+            async def receive(self):
+                try:
+                    return next(self.messages)
+                except StopIteration:
+                    await asyncio.Event().wait()
+
+        class FakeSession:
+            closed = False
+
+            def __init__(self):
+                self.connects = 0
+
+            def ws_connect(self, *_args, **_kwargs):
+                self.connects += 1
+                messages = [account, book, closed] if self.connects == 1 else [account, book]
+                return FakeSocket(messages)
+
+            async def close(self):
+                self.closed = True
+
+        session = FakeSession()
+        self.client._ws_http = session
+        self.client._ws_task = asyncio.create_task(self.client._run_market_socket())
+        try:
+            async def reconnected():
+                while session.connects < 2 or not self.client._ws_ready.is_set():
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(reconnected(), timeout=3)
+            self.assertEqual(await self.client.fetch_bbo_prices("ETH-USD"),
+                             (Decimal("1999"), Decimal("2000")))
+            self.assertEqual(self.client._account.await_count, 2)
+        finally:
+            await self.client.disconnect()
+
+    async def test_market_read_waits_until_reconnect_is_ready(self):
+        self.client._ws_task = asyncio.get_running_loop().create_future()
+        self.client._best_bid = Decimal("1999")
+        self.client._best_ask = Decimal("2000")
+        self.client._book_update_time = time.monotonic()
+        read = asyncio.create_task(self.client.fetch_bbo_prices("ETH-USD"))
+        await asyncio.sleep(0)
+        self.assertFalse(read.done())
+        self.client._ws_ready.set()
+        self.assertEqual(await read, (Decimal("1999"), Decimal("2000")))
 
     async def test_account_read_retries_a_timeout(self):
         calls = {"n": 0}
