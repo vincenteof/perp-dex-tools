@@ -457,12 +457,22 @@ class BulkClient(BaseExchangeClient):
         return await self._place_limit(quantity, price, direction, reduce_only=False)
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        bid, ask = await self.fetch_bbo_prices(contract_id)
-        if side == "sell":
-            price = max(price, bid + self.config.tick_size)
-        else:
-            price = min(price, ask - self.config.tick_size)
-        return await self._place_limit(quantity, self.round_to_tick(price), side, reduce_only=True)
+        """Retry a post-only close when the book has already traded through the target."""
+        last_error = "Close order rejected"
+        for _ in range(15):
+            bid, ask = await self.fetch_bbo_prices(contract_id)
+            adjusted = price
+            if side == "sell" and adjusted <= bid:
+                adjusted = bid + self.config.tick_size
+            elif side == "buy" and adjusted >= ask:
+                adjusted = ask - self.config.tick_size
+            result = await self._place_limit(quantity, self.round_to_tick(adjusted), side, reduce_only=True)
+            if result.success:
+                return result
+            last_error = result.error_message or last_error
+            if "reject" not in last_error.lower() and "cross" not in last_error.lower():
+                return result
+        return OrderResult(success=False, error_message=f"Close order rejected after 15 attempts: {last_error}")
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         order = await self.get_order_info(order_id)

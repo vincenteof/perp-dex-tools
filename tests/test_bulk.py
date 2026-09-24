@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import base58
 
+from exchanges.base import OrderResult
 from exchanges.bulk import BulkClient
 
 
@@ -132,6 +133,28 @@ class BulkClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(signed[1]["reduce_only"])
         posted = self.client._post_signed.await_args_list[0].args[0]
         self.assertEqual(set(posted), {"actions", "nonce", "account", "signer", "signature", "order_id"})
+
+    async def test_close_retries_when_post_only_order_would_cross(self):
+        self._market_is_connected()
+        self.client._lot_size = Decimal("0.0001")
+        self.client._min_notional = Decimal("50")
+        self.config.tick_size = Decimal("0.001")
+        prices = []
+
+        async def place(quantity, price, side, reduce_only):
+            prices.append(price)
+            if len(prices) == 1:
+                return OrderResult(success=False, error_message="rejectedCrossing")
+            return OrderResult(success=True, order_id="close", side=side, size=quantity, price=price, status="OPEN")
+
+        self.client._place_limit = place
+        self.client.fetch_bbo_prices = AsyncMock(side_effect=[
+            (Decimal("2671.7"), Decimal("2671.8")),
+            (Decimal("2671.2"), Decimal("2671.3")),
+        ])
+        result = await self.client.place_close_order("ETH-USD", Decimal("0.02"), Decimal("2671.626"), "sell")
+        self.assertTrue(result.success)
+        self.assertEqual(prices, [Decimal("2671.701"), Decimal("2671.626")])
 
     async def test_cancel_returns_confirmed_partial_fill(self):
         self._market_is_connected()

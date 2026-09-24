@@ -222,7 +222,8 @@ class TradingBot:
         except Exception as e:
             self.logger.log(f"Error placing order: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
-            if self.config.exchange == "bulk":
+            # A timed-out Bulk submit may already be live. A rejected close is not.
+            if self.config.exchange == "bulk" and "outcome is unknown" in str(e):
                 raise
             return False
 
