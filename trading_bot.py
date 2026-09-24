@@ -525,55 +525,66 @@ class TradingBot:
 
             # Main trading loop
             while not self.shutdown_requested:
-                # Update active orders
-                active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                try:
+                    # Update active orders
+                    active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
 
-                # Filter close orders
-                self.active_close_orders = []
-                for order in active_orders:
-                    if order.side == self.config.close_order_side:
-                        self.active_close_orders.append({
-                            'id': order.order_id,
-                            'price': order.price,
-                            'size': order.remaining_size if self.config.exchange == "bulk" else order.size
-                        })
+                    # Filter close orders
+                    self.active_close_orders = []
+                    for order in active_orders:
+                        if order.side == self.config.close_order_side:
+                            self.active_close_orders.append({
+                                'id': order.order_id,
+                                'price': order.price,
+                                'size': order.remaining_size if self.config.exchange == "bulk" else order.size
+                            })
 
-                # Periodic logging
-                mismatch_detected = await self._log_status_periodically()
+                    # Periodic logging
+                    mismatch_detected = await self._log_status_periodically()
 
-                stop_trading, pause_trading = await self._check_price_condition()
-                if stop_trading:
-                    msg = f"\n\nWARNING: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] \n"
-                    msg += "Stopped trading due to stop price triggered\n"
-                    msg += "价格已经达到停止交易价格，脚本将停止交易\n"
-                    await self.send_notification(msg.lstrip())
-                    await self.graceful_shutdown(msg)
-                    continue
+                    stop_trading, pause_trading = await self._check_price_condition()
+                    if stop_trading:
+                        msg = f"\n\nWARNING: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] \n"
+                        msg += "Stopped trading due to stop price triggered\n"
+                        msg += "价格已经达到停止交易价格，脚本将停止交易\n"
+                        await self.send_notification(msg.lstrip())
+                        await self.graceful_shutdown(msg)
+                        continue
 
-                if pause_trading:
+                    if pause_trading:
+                        await asyncio.sleep(5)
+                        continue
+
+                    if not mismatch_detected:
+                        wait_time = self._calculate_wait_time()
+
+                        if wait_time > 0:
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            meet_grid_step_condition = await self._meet_grid_step_condition()
+                            if not meet_grid_step_condition:
+                                await asyncio.sleep(1)
+                                continue
+                    else:
+                        continue
+                except (TimeoutError, ConnectionError, OSError) as exc:
+                    # A slow account or book read is not an order-state failure.
+                    self.logger.log(
+                        f"Temporary exchange read failure: {type(exc).__name__}: {exc}",
+                        "WARNING",
+                    )
                     await asyncio.sleep(5)
                     continue
 
-                if not mismatch_detected:
-                    wait_time = self._calculate_wait_time()
-
-                    if wait_time > 0:
-                        await asyncio.sleep(wait_time)
-                        continue
-                    else:
-                        meet_grid_step_condition = await self._meet_grid_step_condition()
-                        if not meet_grid_step_condition:
-                            await asyncio.sleep(1)
-                            continue
-
-                        await self._place_and_monitor_open_order()
-                        self.last_close_orders += 1
+                await self._place_and_monitor_open_order()
+                self.last_close_orders += 1
 
         except KeyboardInterrupt:
             self.logger.log("Bot stopped by user")
             await self.graceful_shutdown("User interruption (Ctrl+C)")
         except Exception as e:
-            self.logger.log(f"Critical error: {e}", "ERROR")
+            self.logger.log(f"Critical error: {type(e).__name__}: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             await self.graceful_shutdown(f"Critical error: {e}")
             raise

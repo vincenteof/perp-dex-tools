@@ -174,6 +174,24 @@ class BulkClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["status"], "CANCELED")
         self.assertEqual(events[-1]["filled_size"], "0.4")
 
+    async def test_account_read_retries_a_timeout(self):
+        calls = {"n": 0}
+
+        async def request(_method, _path, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise TimeoutError()
+            return [{"fullAccount": {
+                "openOrders": [],
+                "positions": [{"symbol": "ETH-USD", "size": "0.02"}],
+            }}]
+
+        self.client._request = request
+        with patch("exchanges.bulk.asyncio.sleep", new=AsyncMock()):
+            position = await self.client.get_account_positions()
+        self.assertEqual(position, Decimal("0.02"))
+        self.assertEqual(calls["n"], 3)
+
     async def test_account_read_failure_does_not_look_like_empty_position(self):
         self.client._request = AsyncMock(return_value={"error": "unavailable"})
         with self.assertRaisesRegex(ValueError, "invalid account"):

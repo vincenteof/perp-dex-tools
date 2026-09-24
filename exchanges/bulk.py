@@ -43,6 +43,7 @@ class BulkClient(BaseExchangeClient):
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_stop = asyncio.Event()
         self.http: Optional[aiohttp.ClientSession] = None
+        self._ws_http: Optional[aiohttp.ClientSession] = None
         self._handler = None
         self._orders: Dict[str, OrderInfo] = {}
         self._order_events: Dict[str, asyncio.Event] = {}
@@ -109,17 +110,35 @@ class BulkClient(BaseExchangeClient):
             ],
         }
 
+    def _http_session(self) -> aiohttp.ClientSession:
+        if self.http is None or self.http.closed:
+            # total is per REST call. The market socket uses a separate session
+            # so this deadline cannot cancel the WebSocket.
+            self.http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20, connect=10, sock_read=20)
+            )
+        return self.http
+
     async def _request(self, method: str, path: str, **kwargs) -> Any:
-        if self.http is None:
-            self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
-        async with self.http.request(method, f"{self.api_url}/{path}", **kwargs) as response:
+        async with self._http_session().request(method, f"{self.api_url}/{path}", **kwargs) as response:
             response.raise_for_status()
             return await response.json()
 
     async def _account(self) -> Dict[str, Any]:
-        data = await self._request("POST", "account", json={
-            "type": "fullAccount", "user": self.public_key,
-        })
+        last_error: Optional[BaseException] = None
+        for attempt in range(3):
+            try:
+                data = await self._request("POST", "account", json={
+                    "type": "fullAccount", "user": self.public_key,
+                })
+                break
+            except (TimeoutError, aiohttp.ClientError) as exc:
+                last_error = exc
+                if attempt == 2:
+                    raise TimeoutError(f"Bulk account request failed: {exc}") from exc
+                await asyncio.sleep(attempt + 1)
+        else:
+            raise TimeoutError(f"Bulk account request failed: {last_error}") from last_error
         if not isinstance(data, list) or not data or not isinstance(data[0], dict):
             raise ValueError("Bulk returned an invalid account response")
         account = data[0].get("fullAccount")
@@ -181,10 +200,13 @@ class BulkClient(BaseExchangeClient):
         )
 
     async def _run_market_socket(self) -> None:
-        if self.http is None:
-            self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        if self._ws_http is None or self._ws_http.closed:
+            # No total timeout: aiohttp would cancel the socket when it expires.
+            self._ws_http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10)
+            )
         try:
-            async with self.http.ws_connect(self.ws_url, heartbeat=20) as websocket:
+            async with self._ws_http.ws_connect(self.ws_url, heartbeat=20) as websocket:
                 await websocket.send_json(self.subscription_payload())
                 while not self._ws_stop.is_set():
                     message = await websocket.receive()
@@ -265,6 +287,9 @@ class BulkClient(BaseExchangeClient):
         if self.http is not None:
             await self.http.close()
             self.http = None
+        if self._ws_http is not None:
+            await self._ws_http.close()
+            self._ws_http = None
 
     @staticmethod
     def _status(status: Any) -> str:
@@ -352,9 +377,7 @@ class BulkClient(BaseExchangeClient):
 
     async def _post_signed(self, signed: Dict[str, Any]) -> Any:
         body = {key: signed[key] for key in ("actions", "nonce", "account", "signer", "signature")}
-        if self.http is None:
-            self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
-        async with self.http.post(f"{self.api_url}/order", json=body) as response:
+        async with self._http_session().post(f"{self.api_url}/order", json=body) as response:
             data = await response.json(content_type=None)
             if response.status >= 400 and not isinstance(data, dict):
                 response.raise_for_status()
