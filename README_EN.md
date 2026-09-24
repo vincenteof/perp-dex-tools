@@ -129,6 +129,7 @@ You will get 1.3x points boost; rebates (auto rebates system is expected to be l
    **Bulk users**: Use Python 3.10–3.12 and install the official SDK:
 
    ```bash
+   pip uninstall -y bulk-client
    pip install -r bulk_requirements.txt
    ```
 
@@ -245,7 +246,7 @@ python runbot.py --exchange backpack --ticker ETH --direction buy --quantity 0.1
 
 ### Bulk Exchange (single-exchange mode):
 
-Set `BULK_PRIVATE_KEY` (a Base58 private key) in `.env`, then run:
+Set `BULK_PRIVATE_KEY` (a Base58 private key) in `.env`. The default network is mainnet; testnet requires both `BULK_API_URL` and `BULK_WS_URL`. Then run:
 
 ```bash
 python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 --max-orders 40 --wait-time 450

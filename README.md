@@ -147,6 +147,7 @@ Python 版本要求（最佳选项是 Python 3.10 - 3.12）：
    **Bulk 用户**：使用 Python 3.10–3.12，并额外安装官方 SDK：
 
    ```bash
+   pip uninstall -y bulk-client
    pip install -r bulk_requirements.txt
    ```
 
@@ -264,7 +265,7 @@ python runbot.py --exchange backpack --ticker ETH --direction buy --quantity 0.1
 
 ### Bulk 交易所（单交易所模式）：
 
-在 `.env` 中设置 `BULK_PRIVATE_KEY`（Base58 私钥），然后运行：
+在 `.env` 中设置 `BULK_PRIVATE_KEY`（Base58 私钥）。默认连接主网；测试网要同时改 `BULK_API_URL` 和 `BULK_WS_URL`。然后运行：
 
 ```bash
 python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 --max-orders 40 --wait-time 450
