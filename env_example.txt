@@ -67,8 +67,16 @@ STANDX_WALLET_ADDRESS=your_wallet_address_here
 STANDX_PRIVATE_KEY=your_wallet_private_key_here
 STANDX_CHAIN=bsc  # or solana
 
-# Bulk single-exchange trading (base58 private key)
+# Bulk single-exchange trading: choose ONE signing mode.
+# Option A: main wallet signing (existing mode; Base58 private key).
 BULK_PRIVATE_KEY=your_base58_private_key_here
+# BULK_ACCOUNT=your_matching_wallet_public_key_here
+# Option B: authorized agent wallet signing (no main wallet private key).
+# Remove/empty BULK_PRIVATE_KEY above AND unset it in your shell, then set:
+# BULK_AGENT_PRIVATE_KEY=your_agent_base58_private_key_here
+# BULK_ACCOUNT=your_target_main_or_sub_account_public_key_here
+# Register the agent with the target account beforehand using the main wallet.
+# BULK_ACCOUNT is the trading account, NOT the agent wallet address.
 # Defaults are mainnet, where website accounts live:
 # BULK_API_URL=https://mainnet-api1.bulk.trade/api/v1
 # BULK_WS_URL=wss://mainnet-ws1.bulk.trade

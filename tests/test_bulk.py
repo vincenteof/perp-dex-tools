@@ -25,7 +25,7 @@ async def _timeout_wait(awaitable, timeout):
 class BulkClientTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.key = base58.b58encode(bytes(range(32))).decode()
-        self.environment = patch.dict(os.environ, {"BULK_PRIVATE_KEY": self.key}, clear=False)
+        self.environment = patch.dict(os.environ, {"BULK_PRIVATE_KEY": self.key}, clear=True)
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.config = type("Config", (), {

@@ -246,7 +246,25 @@ python runbot.py --exchange backpack --ticker ETH --direction buy --quantity 0.1
 
 ### Bulk Exchange (single-exchange mode):
 
-Set `BULK_PRIVATE_KEY` (a Base58 private key) in `.env`. The default network is mainnet; testnet requires both `BULK_API_URL` and `BULK_WS_URL`. Then run:
+The default network is mainnet; testnet requires both `BULK_API_URL` and `BULK_WS_URL`. Choose one signing mode in `.env`:
+
+- Owner mode: set `BULK_PRIVATE_KEY` (a Base58 private key). Optional `BULK_ACCOUNT` must match the key's public address.
+- Agent wallet mode: authorize the agent with the owner wallet first. The bot needs only the agent private key and the target trading account's public key, not the owner private key.
+
+Example agent configuration (placeholders only; never commit or share real private keys):
+
+```dotenv
+BULK_AGENT_PRIVATE_KEY=your_agent_base58_private_key
+BULK_ACCOUNT=your_target_main_or_sub_account_public_key
+```
+
+`BULK_ACCOUNT` is not the agent address. Complete [Bulk agent authorization](https://docs.bulk.trade/api-reference/manageAgentWallet) with the owner wallet before starting. The bot does not register or revoke agents automatically. Entries, take-profit orders, and cancels are signed by the agent; account queries, fill history, and WebSocket subscriptions use `BULK_ACCOUNT`. A successful account read does not prove agent authorization; confirm it with the owner wallet.
+
+When migrating from owner mode, remove or empty `BULK_PRIVATE_KEY` in the env file and run `unset BULK_PRIVATE_KEY` in the launch shell. Setting both private keys fails rather than silently selecting or falling back to the owner. To switch back to owner mode, clear `BULK_AGENT_PRIVATE_KEY` in both the file and shell. `runbot.py` preserves existing shell variables over the env file, so also unset any stale `BULK_ACCOUNT` to avoid using the wrong trading account.
+
+Agent keys remain sensitive: a leaked key can be used for trading and cause losses. An agent authorized on a master can act on its sub-accounts; independently authorize a dedicated sub-account to narrow the scope. Startup logs show `Bulk Signing Mode`, `Bulk Trading Account`, and `Bulk Signer` (public keys only). The signing SDK remains `bulk-keychain==0.1.27`; after syncing the code, run `python -m pip install -r bulk_requirements.txt` to install the explicitly declared Base58 public-key validation dependency.
+
+Use the existing launch parameters, for example:
 
 ```bash
 python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 --max-orders 40 --wait-time 450
@@ -255,6 +273,8 @@ python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 
 The ticker maps to `ETH-USD`. Quantity must satisfy Bulk's lot size and minimum notional. Entry and take-profit orders use add-liquidity-only limits; take-profit orders are reduce-only. `hedge_mode.py` does not support Bulk yet.
 
 The Bulk WebSocket reconnects and resubscribes automatically. Trading resumes after a fresh book and account-order reconciliation. If a cancellation or an entry order's final state cannot be confirmed, the bot stops opening orders and reports the uncertainty for manual review.
+
+Editing env files does not change a running process's signer. Stop the old process, review its current orders and positions, then launch the new version for the same target account with the existing parameters. Do not run both bot instances concurrently.
 
 ### Aster Exchange:
 

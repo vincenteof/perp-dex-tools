@@ -14,7 +14,8 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
-from bulk_keychain import Signer
+import base58
+from bulk_keychain import Signer, prepare_order
 
 from .base import BaseExchangeClient, OrderInfo, OrderResult
 
@@ -34,11 +35,31 @@ class BulkClient(BaseExchangeClient):
         self.api_url = os.getenv("BULK_API_URL", self.API_URL).rstrip("/")
         self.ws_url = os.getenv("BULK_WS_URL", self.WS_URL)
         self.signature_domain = self.resolve_signature_domain(self.api_url, self.ws_url)
-        self._signer = Signer.from_base58(os.environ["BULK_PRIVATE_KEY"], self.signature_domain)
+        agent_key = os.getenv("BULK_AGENT_PRIVATE_KEY", "").strip()
+        self.uses_agent_wallet = bool(agent_key)
+        private_key = agent_key or os.environ["BULK_PRIVATE_KEY"].strip()
+        try:
+            self._signer = Signer.from_base58(private_key, self.signature_domain)
+        except ValueError:
+            key_name = "BULK_AGENT_PRIVATE_KEY" if self.uses_agent_wallet else "BULK_PRIVATE_KEY"
+            raise ValueError(f"{key_name} must be a valid base58 Ed25519 private key "
+                             "(32-byte seed or 64-byte keypair)") from None
         self._signer.set_compute_order_id(True)
+        self._signer_public_key = self._signer.pubkey
         expected_account = os.getenv("BULK_ACCOUNT", "").strip()
-        if expected_account and expected_account != self._signer.pubkey:
-            raise ValueError("Bulk private key does not match BULK_ACCOUNT")
+        if self.uses_agent_wallet:
+            try:
+                account_bytes = base58.b58decode(expected_account)
+            except ValueError:
+                raise ValueError("BULK_ACCOUNT must be a base58 account public key") from None
+            if len(account_bytes) != 32:
+                raise ValueError("BULK_ACCOUNT must be a 32-byte base58 account public key")
+            if expected_account == self.signer_public_key:
+                raise ValueError("BULK_ACCOUNT must be the trading account, not the agent address")
+        elif expected_account and expected_account != self.signer_public_key:
+            raise ValueError("Bulk private key does not match BULK_ACCOUNT; "
+                             "use BULK_AGENT_PRIVATE_KEY for an authorized agent")
+        self._account_public_key = expected_account or self.signer_public_key
         self._connect_error: Optional[str] = None
         self._fatal_ws_error: Optional[str] = None
         self._account_seen = False
@@ -59,15 +80,41 @@ class BulkClient(BaseExchangeClient):
         self._min_notional = Decimal("0")
 
     def _validate_config(self) -> None:
-        if not os.getenv("BULK_PRIVATE_KEY"):
-            raise ValueError("BULK_PRIVATE_KEY is required for Bulk trading")
+        owner_key = os.getenv("BULK_PRIVATE_KEY", "").strip()
+        agent_key = os.getenv("BULK_AGENT_PRIVATE_KEY", "").strip()
+        if owner_key and agent_key:
+            raise ValueError("Set only one of BULK_PRIVATE_KEY or BULK_AGENT_PRIVATE_KEY; "
+                             "remove the main wallet private key when using an agent")
+        if not owner_key and not agent_key:
+            raise ValueError("BULK_PRIVATE_KEY or BULK_AGENT_PRIVATE_KEY is required for Bulk trading")
+        if agent_key and not os.getenv("BULK_ACCOUNT", "").strip():
+            raise ValueError("BULK_ACCOUNT is required with BULK_AGENT_PRIVATE_KEY")
 
     def get_exchange_name(self) -> str:
         return "bulk"
 
     @property
     def public_key(self) -> str:
-        return self._signer.pubkey
+        """Trading account used by queries and subscriptions, not the agent."""
+        return self._account_public_key
+
+    @property
+    def signer_public_key(self) -> str:
+        return self._signer_public_key
+
+    def _sign_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.uses_agent_wallet:
+            return self._signer.sign(action)
+        # The target account is part of the signed bytes and the order-id hash.
+        # Never replace account after signing a transaction for the agent itself.
+        prepared = prepare_order(
+            action, self.signature_domain,
+            account=self.public_key, signer=self.signer_public_key,
+        )
+        signed = self._signer.sign_prepared(prepared)
+        if signed.get("account") != self.public_key or signed.get("signer") != self.signer_public_key:
+            raise RuntimeError("Bulk agent signature has unexpected account or signer")
+        return signed
 
     @staticmethod
     def resolve_signature_domain(api_url: str, ws_url: str) -> str:
@@ -484,7 +531,7 @@ class BulkClient(BaseExchangeClient):
             return OrderResult(success=False, error_message="Invalid Bulk price or order quantity")
         if not reduce_only and quantity * price < self._min_notional:
             raise ValueError(f"Bulk minimum notional is {self._min_notional} USD")
-        signed = self._signer.sign({
+        signed = self._sign_action({
             "type": "order",
             "symbol": self.symbol,
             "is_buy": side == "buy",
@@ -551,7 +598,7 @@ class BulkClient(BaseExchangeClient):
             return OrderResult(True, order_id, filled_size=order.filled_size)
         await self._wait_market_ready()
         try:
-            signed = self._signer.sign({
+            signed = self._sign_action({
                 "type": "cancel",
                 "symbol": self.symbol,
                 "order_id": order_id,
@@ -624,7 +671,7 @@ class BulkClient(BaseExchangeClient):
             maker = fill.get("maker") == self.public_key
             taker = fill.get("taker") == self.public_key
             if not (maker or taker):
-                raise ValueError("Bulk fill does not belong to the signer account")
+                raise ValueError("Bulk fill does not belong to the trading account")
             filled_order_id = fill.get("orderIdMaker") if maker else fill.get("orderIdTaker")
             if str(filled_order_id or "") == order_id:
                 total += Decimal(str(fill["amount"]))

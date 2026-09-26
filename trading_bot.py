@@ -545,6 +545,11 @@ class TradingBot:
             self.logger.log(f"Max Orders: {self.config.max_orders}", "INFO")
             self.logger.log(f"Wait Time: {self.config.wait_time}s", "INFO")
             self.logger.log(f"Exchange: {self.config.exchange}", "INFO")
+            if self.config.exchange == "bulk":
+                mode = "agent" if self.exchange_client.uses_agent_wallet else "owner"
+                self.logger.log(f"Bulk Signing Mode: {mode}", "INFO")
+                self.logger.log(f"Bulk Trading Account: {self.exchange_client.public_key}", "INFO")
+                self.logger.log(f"Bulk Signer: {self.exchange_client.signer_public_key}", "INFO")
             self.logger.log(f"Grid Step: {self.config.grid_step}%", "INFO")
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")

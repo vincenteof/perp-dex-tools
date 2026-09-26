@@ -265,7 +265,25 @@ python runbot.py --exchange backpack --ticker ETH --direction buy --quantity 0.1
 
 ### Bulk 交易所（单交易所模式）：
 
-在 `.env` 中设置 `BULK_PRIVATE_KEY`（Base58 私钥）。默认连接主网；测试网要同时改 `BULK_API_URL` 和 `BULK_WS_URL`。然后运行：
+默认连接主网；测试网要同时改 `BULK_API_URL` 和 `BULK_WS_URL`。在 `.env` 中选择一种签名方式：
+
+- 主钱包模式：设置 `BULK_PRIVATE_KEY`（Base58 私钥）；可选的 `BULK_ACCOUNT` 必须与该私钥对应的公钥一致。
+- Agent wallet 模式：主钱包先授权 agent，机器人只配置 agent 私钥和目标交易账户公钥，不需要主钱包私钥。
+
+Agent 模式的 `.env` 示例（仅为占位符，不要把真实私钥提交到仓库或贴到日志）：
+
+```dotenv
+BULK_AGENT_PRIVATE_KEY=你的_agent_Base58_私钥
+BULK_ACCOUNT=目标主账户或子账户的公钥
+```
+
+`BULK_ACCOUNT` 不是 agent 地址。先通过主钱包完成 [Bulk agent 授权](https://docs.bulk.trade/api-reference/manageAgentWallet)，再启动机器人；程序不会自动注册或撤销 agent。下单、止盈及撤单均由 agent 签名，账户查询、成交记录和 WebSocket 订阅均使用 `BULK_ACCOUNT`。账户读取成功不代表 agent 已获授权，需在主钱包侧确认授权状态。
+
+从主钱包模式迁移时，删除或清空 env 文件中的 `BULK_PRIVATE_KEY`，并在启动用的 shell 中执行 `unset BULK_PRIVATE_KEY`。两种私钥同时设置会报错，不会静默选择或回退到主钱包；切回主钱包模式时，也需清除 env 文件及 shell 中的 `BULK_AGENT_PRIVATE_KEY`。`runbot.py` 使用 shell 中已有的变量优先于 env 文件，因此同样要清除旧的 `BULK_ACCOUNT`，避免查询错误的交易账户。
+
+Agent 私钥仍需保密，泄露后可能被用于交易并造成亏损。在主账户上授权的 agent 可以作用于其子账户；希望缩小范围时，可给专用子账户独立授权。启动日志会显示 `Bulk Signing Mode`、`Bulk Trading Account` 与 `Bulk Signer`，只输出公钥，不输出私钥。签名 SDK 仍为 `bulk-keychain==0.1.27`；同步代码后执行 `python -m pip install -r bulk_requirements.txt`，以安装显式声明的 Base58 公钥校验依赖。
+
+配置后使用原来的启动参数，例如：
 
 ```bash
 python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 --max-orders 40 --wait-time 450
@@ -274,6 +292,8 @@ python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 
 交易对自动映射为 `ETH-USD`。数量必须符合 Bulk 的 lot size 和最小名义金额。开仓与止盈单使用只挂单限价单；止盈单设为 reduce-only。此适配暂不支持 `hedge_mode.py`。
 
 Bulk WebSocket 断线后会自动重连并重新订阅；重新取得行情和账户订单后才恢复交易。若撤单结果或断线期间的开仓单终态无法确认，程序会停止继续开仓并报错，需要人工核对交易所订单与仓位。
+
+修改 env 不会改变正在运行进程的签名者。迁移时先停止旧进程、核对当前账户订单和仓位，再使用同一目标账户及原来的参数启动新版本；不要同时运行新旧两份机器人。
 
 ### Aster 交易所：
 
