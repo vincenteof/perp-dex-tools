@@ -12,7 +12,7 @@
 
 ## 自动交易机器人
 
-一个支持多个交易所（包括 EdgeX、Backpack、Paradex、Aster、Lighter、GRVT、Extended、ApeX、Nado、Ethereal、StandX 和 Bulk）的模块化交易机器人。该机器人实现了自动下单并在盈利时自动平仓的策略，主要目的是取得高交易量。
+一个支持多个交易所（包括 EdgeX、Backpack、Paradex、Aster、Lighter、GRVT、Extended、ApeX、Nado、Ethereal、StandX、Bulk 和 Arcus）的模块化交易机器人。该机器人实现了自动下单并在盈利时自动平仓的策略，主要目的是取得高交易量。
 
 ## 邀请链接 (获得返佣以及福利)
 
@@ -294,6 +294,12 @@ python runbot.py --exchange bulk --ticker ETH --quantity 0.1 --take-profit 0.02 
 Bulk WebSocket 断线后会自动重连并重新订阅；重新取得行情和账户订单后才恢复交易。若撤单结果或断线期间的开仓单终态无法确认，程序会停止继续开仓并报错，需要人工核对交易所订单与仓位。
 
 修改 env 不会改变正在运行进程的签名者。迁移时先停止旧进程、核对当前账户订单和仓位，再使用同一目标账户及原来的参数启动新版本；不要同时运行新旧两份机器人。
+
+### Arcus 交易所（单交易所模式）：
+
+支持永续合约；开仓及止盈均为 maker-only，止盈为 reduce-only。使用独立 Ed25519 API Signing Key，不需要主钱包私钥。支持主网/测试网、子账户、撤单确认和断线恢复，不支持 Spot RFQ、`hedge_mode.py` 或 `--boost`。
+
+使用 Python 3.12，单独安装 `python -m pip install -r arcus_requirements.txt` 即可，不必安装其他交易所 SDK。配置和测试网启动命令见 [Arcus 部署说明](docs/arcus-setup.md)。首次请先做测试网验收；现有资金管理参数并非严格的美元敞口上限。
 
 ### Aster 交易所：
 

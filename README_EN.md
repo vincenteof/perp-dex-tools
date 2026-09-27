@@ -8,7 +8,7 @@
 
 ## Multi-Exchange Trading Bot
 
-A modular trading bot that supports EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, Extended, ApeX, Nado, Ethereal, StandX, and Bulk. The bot implements an automated strategy that places orders and automatically closes them at a profit.
+A modular trading bot that supports EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, Extended, ApeX, Nado, Ethereal, StandX, Bulk, and Arcus. The bot implements an automated strategy that places orders and automatically closes them at a profit.
 
 ## Referral Links (Enjoy fee rebates and benefits)
 
@@ -243,6 +243,12 @@ ETH Perpetual (with Boost mode enabled):
 ```bash
 python runbot.py --exchange backpack --ticker ETH --direction buy --quantity 0.1 --boost
 ```
+
+### Arcus Exchange (single-exchange mode):
+
+Perpetuals only: maker-only entries and reduce-only maker exits. Uses an authorized Ed25519 API Signing Key, not an Ethereum wallet private key. Mainnet/testnet, subaccounts, confirmed cancellation and reconnect reconciliation are supported. Spot RFQ, hedge mode and boost mode are not supported.
+
+Use Python 3.12 and install `python -m pip install -r arcus_requirements.txt`; other exchange SDKs are unnecessary. Configure `ARCUS_API_SIGNING_KEY`, `ARCUS_ADDRESS`, `ARCUS_ACCOUNT_INDEX` (default 0) and `ARCUS_NETWORK` (mainnet by default; explicitly select testnet for your first run). See the [deployment guide (Chinese)](docs/arcus-setup.md). No authenticated live-order acceptance test has been run; validate on testnet before risking real funds. Existing max-order settings are not a hard dollar exposure cap.
 
 ### Bulk Exchange (single-exchange mode):
 

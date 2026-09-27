@@ -81,6 +81,8 @@ class TradingBot:
         self.order_canceled_event = asyncio.Event()
         self.shutdown_requested = False
         self.loop = None
+        # Bulk and Arcus share ID-correlated event handling. Retain field names
+        # for compatibility with existing Bulk tests and debugging tooling.
         self._bulk_open_order_id = None
         self._bulk_waiting_for_open_ack = False
         self._bulk_early_open_updates = {}
@@ -115,7 +117,7 @@ class TradingBot:
                 side = message.get('side', '')
                 order_type = message.get('order_type', '')
                 filled_size = Decimal(message.get('filled_size'))
-                if self.config.exchange == "bulk" and order_type == "OPEN":
+                if self.config.exchange in {"bulk", "arcus"} and order_type == "OPEN":
                     if order_id != self._bulk_open_order_id:
                         # A fill can beat the HTTP order acknowledgement. Keep
                         # that event by id, but never apply an old order's fill
@@ -123,7 +125,7 @@ class TradingBot:
                         if self._bulk_waiting_for_open_ack and status in {"FILLED", "CANCELED"}:
                             self._bulk_early_open_updates[order_id] = message
                         elif status in {"FILLED", "CANCELED"}:
-                            self.logger.log(f"[OPEN] Ignoring late Bulk update for {order_id}", "WARNING")
+                            self.logger.log(f"[OPEN] Ignoring late {self.config.exchange} update for {order_id}", "WARNING")
                         return
                 if order_type == "OPEN":
                     self.current_order_status = status
@@ -211,7 +213,7 @@ class TradingBot:
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
             self.order_filled_amount = 0.0
-            if self.config.exchange == "bulk":
+            if self.config.exchange in {"bulk", "arcus"}:
                 self._bulk_open_order_id = None
                 self._bulk_waiting_for_open_ack = True
                 self._bulk_early_open_updates.clear()
@@ -222,7 +224,7 @@ class TradingBot:
                 self.config.quantity,
                 self.config.direction
             )
-            if self.config.exchange == "bulk":
+            if self.config.exchange in {"bulk", "arcus"}:
                 self._bulk_open_order_id = order_result.order_id
                 self._bulk_waiting_for_open_ack = False
                 early = self._bulk_early_open_updates.pop(order_result.order_id, None)
@@ -247,7 +249,7 @@ class TradingBot:
             self.logger.log(f"Error placing order: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             # A timed-out Bulk submit may already be live. A rejected close is not.
-            if self.config.exchange == "bulk" and (
+            if self.config.exchange in {"bulk", "arcus"} and (
                 "outcome is unknown" in str(e)
                 or "recovery needs attention" in str(e)
                 or (self._bulk_open_order_id and isinstance(e, (ConnectionError, TimeoutError)))
@@ -255,7 +257,7 @@ class TradingBot:
                 raise
             return False
         finally:
-            if self.config.exchange == "bulk":
+            if self.config.exchange in {"bulk", "arcus"}:
                 self._bulk_open_order_id = None
                 self._bulk_waiting_for_open_ack = False
                 self._bulk_early_open_updates.clear()
@@ -344,8 +346,8 @@ class TradingBot:
                 try:
                     cancel_result = await self.exchange_client.cancel_order(order_id)
                     if not cancel_result.success:
-                        if self.config.exchange == "bulk":
-                            raise RuntimeError(f"Bulk cancel outcome is unknown: {cancel_result.error_message}")
+                        if self.config.exchange in {"bulk", "arcus"}:
+                            raise RuntimeError(f"{self.config.exchange} cancel outcome is unknown: {cancel_result.error_message}")
                         self.order_canceled_event.set()
                         self.logger.log(f"[CLOSE] Failed to cancel order {order_id}: {cancel_result.error_message}", "WARNING")
                     else:
@@ -354,10 +356,10 @@ class TradingBot:
                 except Exception as e:
                     self.order_canceled_event.set()
                     self.logger.log(f"[CLOSE] Error canceling order {order_id}: {e}", "ERROR")
-                    if self.config.exchange == "bulk":
+                    if self.config.exchange in {"bulk", "arcus"}:
                         raise
 
-                if self.config.exchange in {"backpack", "extended", "bulk"}:
+                if self.config.exchange in {"backpack", "extended", "bulk", "arcus"}:
                     self.order_filled_amount = cancel_result.filled_size
                 else:
                     # Wait for cancel event or timeout
@@ -395,8 +397,8 @@ class TradingBot:
                 self.last_open_order_time = time.time()
                 if not close_order_result.success:
                     self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
-                    if self.config.exchange == "bulk":
-                        raise RuntimeError(f"Bulk close order rejected: {close_order_result.error_message}")
+                    if self.config.exchange in {"bulk", "arcus"}:
+                        raise RuntimeError(f"{self.config.exchange} close order rejected: {close_order_result.error_message}")
 
             return True
 
@@ -417,7 +419,7 @@ class TradingBot:
                         self.active_close_orders.append({
                             'id': order.order_id,
                             'price': order.price,
-                            'size': order.remaining_size if self.config.exchange == "bulk" else order.size
+                            'size': order.remaining_size if self.config.exchange in {"bulk", "arcus"} else order.size
                         })
 
                 # Get positions
@@ -550,6 +552,11 @@ class TradingBot:
                 self.logger.log(f"Bulk Signing Mode: {mode}", "INFO")
                 self.logger.log(f"Bulk Trading Account: {self.exchange_client.public_key}", "INFO")
                 self.logger.log(f"Bulk Signer: {self.exchange_client.signer_public_key}", "INFO")
+            if self.config.exchange == "arcus":
+                self.logger.log(f"Arcus Network: {self.exchange_client.network}", "INFO")
+                self.logger.log(f"Arcus Trading Account: {self.exchange_client.address}", "INFO")
+                self.logger.log(f"Arcus Subaccount: {self.exchange_client.account_index}", "INFO")
+                self.logger.log(f"Arcus API Key: {self.exchange_client.api_key}", "INFO")
             self.logger.log(f"Grid Step: {self.config.grid_step}%", "INFO")
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
@@ -577,7 +584,7 @@ class TradingBot:
                             self.active_close_orders.append({
                                 'id': order.order_id,
                                 'price': order.price,
-                                'size': order.remaining_size if self.config.exchange == "bulk" else order.size
+                                'size': order.remaining_size if self.config.exchange in {"bulk", "arcus"} else order.size
                             })
 
                     # Periodic logging

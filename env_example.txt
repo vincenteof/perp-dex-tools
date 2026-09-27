@@ -86,6 +86,16 @@ BULK_PRIVATE_KEY=your_base58_private_key_here
 # BULK_WS_URL=wss://exchange-ws1.bulk.trade
 # BULK_SIGNATURE_DOMAIN=testnet
 
+# Arcus perpetuals, single-exchange maker mode. Not an Ethereum wallet private key.
+# Generate/authorize an API key in the web app, then copy its API Signing Key.
+# ARCUS_API_SIGNING_KEY=your_64_hex_character_api_signing_key
+# ARCUS_ADDRESS=0x_your_master_wallet_address
+# ARCUS_ACCOUNT_INDEX=0
+# ARCUS_NETWORK=testnet
+# Optional public key consistency check (derived automatically if omitted):
+# ARCUS_API_KEY=your_64_hex_character_api_public_key
+# Set ARCUS_NETWORK=mainnet only when you intentionally want real-money trading.
+
 # Notification (optional)
 # guide: https://www.feishu.cn/hc/zh-CN/articles/185289387886-%E6%B6%88%E6%81%AF%E5%8A%A9%E6%89%8B-%E6%9C%BA%E5%99%A8%E4%BA%BA
 LARK_TOKEN=
