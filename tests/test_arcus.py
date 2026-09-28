@@ -1,12 +1,14 @@
 import asyncio
 import json
 import os
+import time
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from exchanges.arcus import ArcusAPIError, ArcusClient
+from exchanges.base import OrderResult
 from exchanges.factory import ExchangeFactory
 from tests import test_bulk_bot
 import aiohttp
@@ -17,12 +19,138 @@ class ArcusBotOrderEventTests(test_bulk_bot.BulkBotOrderEventTests):
     def setUp(self):
         super().setUp()
         self.bot.config.exchange = "arcus"
+        self.bot.shutdown_requested = False
+        self.bot.send_notification = AsyncMock()
 
     async def test_unknown_submit_stops_bot_instead_of_opening_again(self):
         self.bot.exchange_client.place_open_order = AsyncMock(
             side_effect=RuntimeError("Arcus submit outcome is unknown"))
         with self.assertRaisesRegex(RuntimeError, "outcome is unknown"):
             await self.bot._place_and_monitor_open_order()
+
+    async def test_stale_quote_keeps_existing_open_order_until_confirmed_fill(self):
+        self.bot.exchange_client.get_order_price = AsyncMock(side_effect=[
+            ConnectionError("stale"), ConnectionError("stale"), Decimal("2001")
+        ])
+        self.bot.exchange_client.get_order_for_recovery = AsyncMock(side_effect=[
+            SimpleNamespace(status="OPEN", filled_size=Decimal(0)),
+            SimpleNamespace(status="FILLED", filled_size=Decimal("0.1")),
+        ])
+        self.bot.exchange_client.cancel_order = AsyncMock(return_value=OrderResult(
+            True, "entry", filled_size=Decimal("0.1"), status="FILLED"
+        ))
+        self.bot.exchange_client.place_close_order = AsyncMock(return_value=OrderResult(
+            True, "exit", "sell", Decimal("0.1"), Decimal("2000.4"), "OPEN"
+        ))
+        with patch("trading_bot.asyncio.sleep", new=AsyncMock()):
+            result = await self.bot._handle_order_result(OrderResult(
+                True, "entry", "buy", Decimal("0.1"), Decimal("2000"), "OPEN"
+            ))
+        self.assertTrue(result)
+        self.assertEqual(self.bot.exchange_client.get_order_for_recovery.await_count, 2)
+        self.bot.exchange_client.cancel_order.assert_awaited_once_with("entry")
+        self.bot.send_notification.assert_awaited_once()
+        self.assertEqual(self.bot.exchange_client.place_close_order.await_args.args[1], Decimal("0.1"))
+        self.assertEqual(self.bot.exchange_client.place_close_order.await_args.args[2], Decimal("2000.4"))
+
+    async def test_unconfirmed_order_pauses_without_cancel_or_replacement(self):
+        self.bot.exchange_client.get_order_price = AsyncMock(side_effect=ConnectionError("stale"))
+        self.bot.exchange_client.get_order_for_recovery = AsyncMock(
+            side_effect=ConnectionError("order state unavailable")
+        )
+        self.bot.exchange_client.cancel_order = AsyncMock()
+        self.bot.exchange_client.place_close_order = AsyncMock()
+
+        async def stop_after_retry(_seconds):
+            self.bot.shutdown_requested = True
+
+        with patch("trading_bot.asyncio.sleep", side_effect=stop_after_retry):
+            with self.assertRaisesRegex(RuntimeError, "remains unresolved"):
+                await self.bot._handle_order_result(OrderResult(
+                    True, "entry", "buy", Decimal("0.1"), Decimal("2000"), "OPEN"
+                ))
+        self.bot.exchange_client.cancel_order.assert_not_awaited()
+        self.bot.exchange_client.place_close_order.assert_not_awaited()
+
+    async def test_recovery_of_canceled_unfilled_order_needs_no_quote_or_close(self):
+        self.bot.exchange_client.get_order_price = AsyncMock(side_effect=ConnectionError("stale"))
+        self.bot.exchange_client.get_order_for_recovery = AsyncMock(return_value=SimpleNamespace(
+            status="CANCELED", filled_size=Decimal(0)
+        ))
+        self.bot.exchange_client.cancel_order = AsyncMock(return_value=OrderResult(
+            True, "entry", filled_size=Decimal(0), status="CANCELED"
+        ))
+        self.bot.exchange_client.place_close_order = AsyncMock()
+        self.assertTrue(await self.bot._handle_order_result(OrderResult(
+            True, "entry", "buy", Decimal("0.1"), Decimal("2000"), "OPEN"
+        )))
+        self.bot.exchange_client.get_order_price.assert_awaited_once()
+        self.bot.exchange_client.cancel_order.assert_awaited_once_with("entry")
+        self.bot.exchange_client.place_close_order.assert_not_awaited()
+
+    async def test_recovery_of_partial_fill_closes_only_confirmed_size(self):
+        self.bot.exchange_client.get_order_price = AsyncMock(side_effect=[
+            ConnectionError("stale"), Decimal("2001")
+        ])
+        self.bot.exchange_client.get_order_for_recovery = AsyncMock(return_value=SimpleNamespace(
+            status="PARTIALLY_FILLED", filled_size=Decimal("0.04")
+        ))
+        self.bot.exchange_client.cancel_order = AsyncMock(return_value=OrderResult(
+            True, "entry", filled_size=Decimal("0.04"), status="CANCELED"
+        ))
+        self.bot.exchange_client.place_close_order = AsyncMock(return_value=OrderResult(
+            True, "exit", "sell", Decimal("0.04"), Decimal("2000.4"), "OPEN"
+        ))
+        self.assertTrue(await self.bot._handle_order_result(OrderResult(
+            True, "entry", "buy", Decimal("0.1"), Decimal("2000"), "OPEN"
+        )))
+        self.assertEqual(self.bot.exchange_client.place_close_order.await_args.args[1], Decimal("0.04"))
+
+    async def test_stale_quote_before_close_retries_only_after_recovery(self):
+        self.bot.order_filled_event.set()
+        self.bot.exchange_client.place_close_order = AsyncMock(side_effect=[
+            ConnectionError("stale"),
+            OrderResult(True, "exit", "sell", Decimal("0.1"), Decimal("2000.4"), "OPEN"),
+        ])
+        self.bot.exchange_client.get_order_for_recovery = AsyncMock(return_value=SimpleNamespace(
+            status="FILLED", filled_size=Decimal("0.1")
+        ))
+        self.bot.exchange_client.get_order_price = AsyncMock(return_value=Decimal("2001"))
+        self.assertTrue(await self.bot._handle_order_result(OrderResult(
+            True, "entry", "buy", Decimal("0.1"), Decimal("2000"), "FILLED"
+        )))
+        self.assertEqual(self.bot.exchange_client.place_close_order.await_count, 2)
+
+    async def test_uncertain_close_submission_is_never_retried(self):
+        self.bot.order_filled_event.set()
+        self.bot.exchange_client.place_close_order = AsyncMock(
+            side_effect=RuntimeError("Arcus submit outcome is unknown"))
+        with self.assertRaisesRegex(RuntimeError, "outcome is unknown"):
+            await self.bot._handle_order_result(OrderResult(
+                True, "entry", "buy", Decimal("0.1"), Decimal("2000"), "FILLED"
+            ))
+        self.bot.exchange_client.place_close_order.assert_awaited_once()
+
+    async def test_rejected_close_stops_new_opening_orders(self):
+        self.bot.exchange_client.place_open_order = AsyncMock(return_value=OrderResult(
+            True, "entry", "buy", Decimal("0.1"), Decimal("2000"), "FILLED"
+        ))
+        self.bot.exchange_client.place_close_order = AsyncMock(return_value=OrderResult(
+            False, "exit", error_message="cancelled"
+        ))
+        with self.assertRaisesRegex(Exception, "Failed to place close order"):
+            await self.bot._place_and_monitor_open_order()
+        self.bot.exchange_client.place_open_order.assert_awaited_once()
+        self.bot.send_notification.assert_awaited_once()
+
+    async def test_unexpected_error_after_open_ack_cannot_start_another_order(self):
+        self.bot.exchange_client.place_open_order = AsyncMock(return_value=OrderResult(
+            True, "entry", "buy", Decimal("0.1"), Decimal("2000"), "FILLED"
+        ))
+        self.bot._handle_order_result = AsyncMock(side_effect=ValueError("invalid quote"))
+        with self.assertRaisesRegex(ValueError, "invalid quote"):
+            await self.bot._place_and_monitor_open_order()
+        self.bot.exchange_client.place_open_order.assert_awaited_once()
 
 
 class ArcusTests(unittest.IsolatedAsyncioTestCase):
@@ -192,6 +320,37 @@ class ArcusTests(unittest.IsolatedAsyncioTestCase):
         self.client._get = AsyncMock(side_effect=ArcusAPIError(404, "not found"))
         with self.assertRaisesRegex(RuntimeError, "outcome is unknown"):
             await self.client.get_order_info("entry")
+
+    async def test_recovery_requires_authoritative_order_state(self):
+        self.client._get = AsyncMock(side_effect=ArcusAPIError(404, "not found"))
+        with self.assertRaisesRegex(ConnectionError, "cannot yet be confirmed"):
+            await self.client.get_order_for_recovery("entry")
+
+    async def test_recovery_refreshes_cached_open_order_from_rest(self):
+        self.client._remember(self.raw())
+        self.client._get = AsyncMock(return_value=self.raw(status="FILLED", remaining="0", seq=2))
+        order = await self.client.get_order_for_recovery("entry")
+        self.assertEqual(order.status, "FILLED")
+        self.assertEqual(order.filled_size, Decimal("0.02"))
+        self.client._get.assert_awaited_once()
+
+    async def test_invalid_recovery_response_keeps_order_unconfirmed(self):
+        self.client._get = AsyncMock(return_value={
+            "marketDisplayName": "ETH-USD", "marketId": 2, "status": "OPEN"
+        })
+        with self.assertRaisesRegex(ConnectionError, "invalid recovery response"):
+            await self.client.get_order_for_recovery("entry")
+
+    async def test_stale_book_invalidates_readiness_and_restarts_stream(self):
+        socket = SimpleNamespace(closed=False, close=AsyncMock())
+        self.client._ws = socket
+        self.client._ready.set()
+        self.client._book = (Decimal("2700"), Decimal("2700.01"))
+        self.client._book_at = time.monotonic() - 11
+        with self.assertRaisesRegex(ConnectionError, "stale or empty"):
+            await self.client.fetch_bbo_prices("ETH-USD")
+        self.assertFalse(self.client._ready.is_set())
+        socket.close.assert_awaited_once()
 
     async def test_remaining_orders_and_short_position(self):
         self.client._get = AsyncMock(return_value={"orders": [self.raw(remaining="0.01", side="SELL")]})

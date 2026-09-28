@@ -69,6 +69,7 @@ class ArcusClient(BaseExchangeClient):
         self.market = None
         self.http = None
         self._ws_http = None
+        self._ws = None
         self._task = None
         self._ready = asyncio.Event()
         self._stop = asyncio.Event()
@@ -222,6 +223,7 @@ class ArcusClient(BaseExchangeClient):
                 if self._ws_http is None or self._ws_http.closed:
                     self._ws_http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
                 async with self._ws_http.ws_connect(self.ws_url, heartbeat=15, receive_timeout=45) as ws:
+                    self._ws = ws
                     await ws.send_json({"type": "subscribe", "channel": "l2Orderbook",
                                         "id": self.symbol, "nLevels": 1})
                     await ws.send_json({"type": "subscribe", "channel": "orders", "id": self.address,
@@ -261,6 +263,7 @@ class ArcusClient(BaseExchangeClient):
             except Exception as exc:
                 logger.warning("Arcus stream disconnected; reconnecting: %s", exc)
             finally:
+                self._ws = None
                 if not self._fatal:
                     self._ready.clear()
             await asyncio.sleep(backoff)
@@ -346,6 +349,14 @@ class ArcusClient(BaseExchangeClient):
             raise ValueError("Arcus contract does not match configured market")
         await self._wait_ready()
         if self._book is None or time.monotonic() - self._book_at > 10:
+            # A live socket can remain open without a usable book. Invalidate
+            # readiness and force a new snapshot plus order reconciliation.
+            self._ready.clear()
+            if self._ws is not None and not self._ws.closed:
+                try:
+                    await self._ws.close()
+                except Exception as exc:
+                    logger.warning("Arcus stale socket could not be closed: %s", exc)
             raise ConnectionError("Arcus order book is stale or empty")
         return self._book
 
@@ -464,6 +475,20 @@ class ArcusClient(BaseExchangeClient):
                 raise RuntimeError(f"Arcus order outcome is unknown for {order_id}: query failed") from exc
             raise
         return self._remember(raw)
+
+    async def get_order_for_recovery(self, order_id):
+        """Read an in-flight order authoritatively while market data recovers."""
+        try:
+            raw = await self._get("/order/" + quote(order_id, safe=""), **self._scope())
+        except (ArcusAPIError, aiohttp.ClientError, TimeoutError, OSError, ValueError, TypeError) as exc:
+            raise ConnectionError(f"Arcus order {order_id} cannot yet be confirmed") from exc
+        try:
+            order = self._remember(raw)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ConnectionError(f"Arcus order {order_id} has an invalid recovery response") from exc
+        if order is None or order.order_id != order_id or order.status not in LIVE | TERMINAL:
+            raise ConnectionError(f"Arcus order {order_id} has no confirmed terminal/live state")
+        return order
 
     async def get_active_orders(self, contract_id):
         if contract_id != self.symbol:

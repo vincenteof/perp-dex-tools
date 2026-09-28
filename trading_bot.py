@@ -248,6 +248,14 @@ class TradingBot:
         except Exception as e:
             self.logger.log(f"Error placing order: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            if self.config.exchange == "arcus" and self._bulk_open_order_id:
+                message = (f"[OPEN] [{self._bulk_open_order_id}] Arcus order handling stopped: {e}; "
+                           "check the live order, position, and take-profit orders before restarting")
+                try:
+                    await self.send_notification(message)
+                except Exception as notify_exc:
+                    self.logger.log(f"Arcus order alert failed: {notify_exc}", "WARNING")
+                raise
             # A timed-out Bulk submit may already be live. A rejected close is not.
             if self.config.exchange in {"bulk", "arcus"} and (
                 "outcome is unknown" in str(e)
@@ -261,6 +269,82 @@ class TradingBot:
                 self._bulk_open_order_id = None
                 self._bulk_waiting_for_open_ack = False
                 self._bulk_early_open_updates.clear()
+
+    async def _recover_arcus_open_order(self, order_id):
+        """Pause on stale quotes without forgetting an already submitted order."""
+        started = time.monotonic()
+        next_alert = started + 30
+        warned_fill = False
+        self.logger.log(f"[OPEN] [{order_id}] Arcus market data unavailable; pausing order changes", "WARNING")
+        while not self.shutdown_requested:
+            try:
+                order = await self.exchange_client.get_order_for_recovery(order_id)
+                if order.filled_size > 0 and not warned_fill:
+                    warned_fill = True
+                    message = (f"[OPEN] [{order_id}] Filled {order.filled_size} while Arcus market data "
+                               "is recovering; take-profit placement is pending")
+                    self.logger.log(message, "ERROR")
+                    try:
+                        await self.send_notification(message)
+                    except Exception as exc:
+                        self.logger.log(f"Arcus recovery notification failed: {exc}", "WARNING")
+                if order.status in {"CANCELED", "REJECTED"} and order.filled_size == 0:
+                    self.logger.log(f"[OPEN] [{order_id}] Confirmed {order.status}; no fill to close", "INFO")
+                    return None, order
+                price = await self.exchange_client.get_order_price(self.config.direction)
+                self.logger.log(f"[OPEN] [{order_id}] Arcus market data and order state recovered", "INFO")
+                return price, order
+            except (ConnectionError, TimeoutError, OSError) as exc:
+                if time.monotonic() >= next_alert:
+                    message = (f"[OPEN] [{order_id}] Arcus recovery pending: {exc}; "
+                               "no new opening orders will be submitted")
+                    self.logger.log(message, "ERROR")
+                    try:
+                        await self.send_notification(message)
+                    except Exception as notify_exc:
+                        self.logger.log(f"Arcus recovery notification failed: {notify_exc}", "WARNING")
+                    next_alert = time.monotonic() + 60
+                await asyncio.sleep(5)
+            except RuntimeError as exc:
+                if "recovery needs attention" not in str(exc):
+                    raise
+                if time.monotonic() >= next_alert:
+                    message = (f"[OPEN] [{order_id}] Arcus order state needs manual attention: {exc}; "
+                               "no new opening orders will be submitted")
+                    self.logger.log(message, "ERROR")
+                    try:
+                        await self.send_notification(message)
+                    except Exception as notify_exc:
+                        self.logger.log(f"Arcus recovery notification failed: {notify_exc}", "WARNING")
+                    next_alert = time.monotonic() + 60
+                await asyncio.sleep(5)
+        raise RuntimeError(f"Arcus order {order_id} remains unresolved during shutdown")
+
+    async def _get_monitored_open_price(self, order_id):
+        try:
+            return await self.exchange_client.get_order_price(self.config.direction), None
+        except (ConnectionError, TimeoutError) as exc:
+            if self.config.exchange != "arcus":
+                raise
+            return await self._recover_arcus_open_order(order_id)
+
+    async def _place_close_after_open(self, order_id, quantity, price, side):
+        while True:
+            try:
+                return await self.exchange_client.place_close_order(
+                    self.config.contract_id, quantity, price, side
+                )
+            except (ConnectionError, TimeoutError):
+                if self.config.exchange != "arcus":
+                    raise
+                # Arcus raises these only before submitting the close order.
+                # Never retry an ambiguous POST acknowledgement.
+                _, order = await self._recover_arcus_open_order(order_id)
+                if order.filled_size < quantity:
+                    raise RuntimeError(
+                        f"Arcus recovery needs attention: opening order {order_id} "
+                        f"confirms only {order.filled_size}, expected at least {quantity}"
+                    )
 
     async def _handle_order_result(self, order_result) -> bool:
         """Handle the result of an order placement."""
@@ -283,11 +367,8 @@ class TradingBot:
                 else:
                     close_price = filled_price * (1 - self.config.take_profit/100)
 
-                close_order_result = await self.exchange_client.place_close_order(
-                    self.config.contract_id,
-                    self.config.quantity,
-                    close_price,
-                    close_side
+                close_order_result = await self._place_close_after_open(
+                    order_id, self.config.quantity, close_price, close_side
                 )
                 if self.config.exchange == "lighter":
                     await asyncio.sleep(1)
@@ -299,7 +380,7 @@ class TradingBot:
                 return True
 
         else:
-            new_order_price = await self.exchange_client.get_order_price(self.config.direction)
+            new_order_price, recovered_order = await self._get_monitored_open_price(order_id)
 
             def should_wait(direction: str, new_order_price: Decimal, order_result_price: Decimal) -> bool:
                 if direction == "buy":
@@ -308,15 +389,17 @@ class TradingBot:
                     return new_order_price >= order_result_price
                 return False
 
-            if self.config.exchange == "lighter":
+            if recovered_order is not None:
+                current_order_status = recovered_order.status
+            elif self.config.exchange == "lighter":
                 current_order_status = self.exchange_client.current_order.status
             else:
                 order_info = await self.exchange_client.get_order_info(order_id)
                 current_order_status = order_info.status
 
             while (
-                should_wait(self.config.direction, new_order_price, order_result.price)
-                and current_order_status == "OPEN"
+                current_order_status == "OPEN"
+                and should_wait(self.config.direction, new_order_price, order_result.price)
             ):
                 self.logger.log(f"[OPEN] [{order_id}] Waiting for order to be filled @ {order_result.price}", "INFO")
                 await asyncio.sleep(5)
@@ -326,7 +409,9 @@ class TradingBot:
                     order_info = await self.exchange_client.get_order_info(order_id)
                     if order_info is not None:
                         current_order_status = order_info.status
-                new_order_price = await self.exchange_client.get_order_price(self.config.direction)
+                new_order_price, recovered_order = await self._get_monitored_open_price(order_id)
+                if recovered_order is not None:
+                    current_order_status = recovered_order.status
 
             self.order_canceled_event.clear()
             # Cancel the order if it's still open
@@ -385,11 +470,8 @@ class TradingBot:
                     else:
                         close_price = filled_price * (1 - self.config.take_profit/100)
 
-                    close_order_result = await self.exchange_client.place_close_order(
-                        self.config.contract_id,
-                        self.order_filled_amount,
-                        close_price,
-                        close_side
+                    close_order_result = await self._place_close_after_open(
+                        order_id, self.order_filled_amount, close_price, close_side
                     )
                     if self.config.exchange == "lighter":
                         await asyncio.sleep(1)
