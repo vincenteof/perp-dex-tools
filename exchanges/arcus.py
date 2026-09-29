@@ -371,10 +371,26 @@ class ArcusClient(BaseExchangeClient):
         return await self._place(quantity, await self.get_order_price(direction), direction, False)
 
     async def place_close_order(self, contract_id, quantity, price, side):
-        bid, ask = await self.fetch_bbo_prices(contract_id)
-        # Preserve take-profit target; move outward only if needed to remain maker.
-        price = max(price, ask) if side == "sell" else min(price, bid)
-        return await self._place(quantity, self._snap(price, side), side, True)
+        # Only a confirmed, zero-fill post-only rejection is safe to resubmit.
+        # A lost acknowledgement or an unconfirmed order must remain unknown.
+        for attempt in range(5):
+            bid, ask = await self.fetch_bbo_prices(contract_id)
+            tick = self._price_tick(ask if side == "sell" else bid)
+            if side == "sell":
+                adjusted = max(price, ask + tick if attempt else ask)
+            else:
+                adjusted = min(price, bid - tick if attempt else bid)
+            result = await self._place(quantity, self._snap(adjusted, side), side, True)
+            if result.success:
+                return result
+            if (not result.order_id
+                    or result.status not in {"REJECTED", "CANCELED"}
+                    or result.filled_size != 0
+                    or result.error_message != "POST_ONLY_WOULD_CROSS"):
+                return result
+        return OrderResult(False, result.order_id, side, quantity, result.price,
+                           result.status, "Arcus close rejected after 5 POST_ONLY_WOULD_CROSS attempts",
+                           result.filled_size)
 
     async def _place(self, quantity, price, side, reduce_only):
         self._check_quantity(quantity)

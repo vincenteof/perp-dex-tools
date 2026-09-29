@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from exchanges.arcus import ArcusAPIError, ArcusClient
-from exchanges.base import OrderResult
+from exchanges.base import OrderInfo, OrderResult
 from exchanges.factory import ExchangeFactory
 from tests import test_bulk_bot
 import aiohttp
@@ -262,6 +262,122 @@ class ArcusTests(unittest.IsolatedAsyncioTestCase):
         self.client._confirm = AsyncMock(return_value=order)
         await self.client._place(Decimal("0.0001"), Decimal("2700.01"), "sell", True)
         self.assertTrue(self.client._request.await_args.kwargs["json"]["reduceOnly"])
+
+    async def test_close_retries_only_confirmed_post_only_cross_and_preserves_target(self):
+        self.client.fetch_bbo_prices = AsyncMock(side_effect=[
+            (Decimal("2700"), Decimal("2700.01")),
+            (Decimal("2700.03"), Decimal("2700.04")),
+        ])
+        rejected = OrderResult(False, "rejected", "sell", Decimal("0.02"),
+                               Decimal("2700.02"), "REJECTED", "POST_ONLY_WOULD_CROSS", Decimal(0))
+        accepted = OrderResult(True, "close", "sell", Decimal("0.02"),
+                               Decimal("2700.05"), "OPEN", filled_size=Decimal(0))
+        self.client._place = AsyncMock(side_effect=[rejected, accepted])
+
+        result = await self.client.place_close_order(
+            "ETH-USD", Decimal("0.02"), Decimal("2700.02"), "sell"
+        )
+
+        self.assertIs(result, accepted)
+        self.assertEqual([call.args[1] for call in self.client._place.await_args_list],
+                         [Decimal("2700.02"), Decimal("2700.05")])
+        self.assertTrue(all(call.args[3] for call in self.client._place.await_args_list))
+
+    async def test_confirmed_arcus_rejection_reposts_with_new_client_id(self):
+        self.client.fetch_bbo_prices = AsyncMock(side_effect=[
+            (Decimal("2700"), Decimal("2700.01")),
+            (Decimal("2700.03"), Decimal("2700.04")),
+        ])
+        self.client._request = AsyncMock(side_effect=[
+            {"orderId": "rejected"}, {"orderId": "close"},
+        ])
+        self.client._confirm = AsyncMock(side_effect=[
+            OrderInfo("rejected", "sell", Decimal("0.02"), Decimal("2700.02"),
+                      "REJECTED", Decimal(0), Decimal("0.02"), "POST_ONLY_WOULD_CROSS"),
+            OrderInfo("close", "sell", Decimal("0.02"), Decimal("2700.05"),
+                      "OPEN", Decimal(0), Decimal("0.02")),
+        ])
+
+        result = await self.client.place_close_order(
+            "ETH-USD", Decimal("0.02"), Decimal("2700.02"), "sell"
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.order_id, "close")
+        posted = [call.kwargs["json"] for call in self.client._request.await_args_list]
+        self.assertEqual([body["price"] for body in posted], ["2700.02", "2700.05"])
+        self.assertTrue(all(body["reduceOnly"] and body["timeInForce"] == "ALO" for body in posted))
+        self.assertNotEqual(posted[0]["clientId"], posted[1]["clientId"])
+
+    async def test_buy_close_retry_moves_outward_without_weakening_target(self):
+        self.client.fetch_bbo_prices = AsyncMock(side_effect=[
+            (Decimal("2700.01"), Decimal("2700.02")),
+            (Decimal("2699.98"), Decimal("2699.99")),
+        ])
+        self.client._place = AsyncMock(side_effect=[
+            OrderResult(False, "rejected", "buy", Decimal("0.02"), Decimal("2700"),
+                        "REJECTED", "POST_ONLY_WOULD_CROSS", Decimal(0)),
+            OrderResult(True, "close", "buy", Decimal("0.02"), Decimal("2699.97"), "OPEN"),
+        ])
+
+        result = await self.client.place_close_order(
+            "ETH-USD", Decimal("0.02"), Decimal("2700"), "buy"
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual([call.args[1] for call in self.client._place.await_args_list],
+                         [Decimal("2700"), Decimal("2699.97")])
+
+    async def test_other_close_rejection_is_not_retried(self):
+        self.client.fetch_bbo_prices = AsyncMock(return_value=(Decimal("2700"), Decimal("2700.01")))
+        rejected = OrderResult(False, "rejected", "sell", Decimal("0.02"), Decimal("2700.02"),
+                               "REJECTED", "INSUFFICIENT_MARGIN", Decimal(0))
+        self.client._place = AsyncMock(return_value=rejected)
+
+        result = await self.client.place_close_order(
+            "ETH-USD", Decimal("0.02"), Decimal("2700.02"), "sell"
+        )
+
+        self.assertIs(result, rejected)
+        self.client._place.assert_awaited_once()
+
+    async def test_partial_or_unconfirmed_cross_is_not_retried(self):
+        self.client.fetch_bbo_prices = AsyncMock(return_value=(Decimal("2700"), Decimal("2700.01")))
+        for status, filled, order_id in (
+            ("REJECTED", Decimal("0.01"), "rejected"),
+            (None, Decimal(0), "rejected"),
+            ("REJECTED", Decimal(0), None),
+        ):
+            with self.subTest(status=status, filled=filled, order_id=order_id):
+                self.client._place = AsyncMock(return_value=OrderResult(
+                    False, order_id, "sell", Decimal("0.02"), Decimal("2700.02"),
+                    status, "POST_ONLY_WOULD_CROSS", filled
+                ))
+                result = await self.client.place_close_order(
+                    "ETH-USD", Decimal("0.02"), Decimal("2700.02"), "sell"
+                )
+                self.assertFalse(result.success)
+                self.client._place.assert_awaited_once()
+
+    async def test_unknown_close_submit_is_never_retried(self):
+        self.client.fetch_bbo_prices = AsyncMock(return_value=(Decimal("2700"), Decimal("2700.01")))
+        self.client._place = AsyncMock(side_effect=RuntimeError("Arcus submit outcome is unknown"))
+        with self.assertRaisesRegex(RuntimeError, "outcome is unknown"):
+            await self.client.place_close_order("ETH-USD", Decimal("0.02"), Decimal("2700.02"), "sell")
+        self.client._place.assert_awaited_once()
+
+    async def test_post_only_close_retries_are_bounded(self):
+        self.client.fetch_bbo_prices = AsyncMock(return_value=(Decimal("2700"), Decimal("2700.01")))
+        self.client._place = AsyncMock(return_value=OrderResult(
+            False, "rejected", "sell", Decimal("0.02"), Decimal("2700.02"),
+            "REJECTED", "POST_ONLY_WOULD_CROSS", Decimal(0)
+        ))
+        result = await self.client.place_close_order(
+            "ETH-USD", Decimal("0.02"), Decimal("2700.02"), "sell"
+        )
+        self.assertFalse(result.success)
+        self.assertIn("after 5", result.error_message)
+        self.assertEqual(self.client._place.await_count, 5)
 
     async def test_snapshot_does_not_replay_historical_fills(self):
         await self.client._reconcile({"openOrders": [self.raw()],
